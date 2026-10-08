@@ -1,0 +1,12 @@
+{
+  "name": "@merces/importer-subgraph",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@merces/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.2"
+  }
+}

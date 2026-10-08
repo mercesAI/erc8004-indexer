@@ -1,0 +1,26 @@
+{
+  "name": "@merces/ops",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:ui": "vite build"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.5",
+    "@merces/shared": "workspace:*",
+    "hono": "4.13.13",
+    "viem": "2.57.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.13",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^4.7.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "recharts": "^2.15.4",
+    "tailwindcss": "^4.1.13",
+    "typescript": "^5.9.2",
+    "vite": "^6.3.5"
+  }
+}

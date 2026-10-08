@@ -1,0 +1,21 @@
+import pg from "pg";
+import { envString } from "./env.js";
+
+let pool: pg.Pool | undefined;
+
+export function getPool(): pg.Pool {
+  if (!pool) {
+    pool = new pg.Pool({
+      connectionString: envString("DATABASE_URL"),
+      max: 10,
+    });
+  }
+  return pool;
+}
+
+export async function closePool(): Promise<void> {
+  if (pool) {
+    await pool.end();
+    pool = undefined;
+  }
+}

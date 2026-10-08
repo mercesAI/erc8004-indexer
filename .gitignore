@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.ponder/
+**/generated/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+.pnpm-store/
+*.log

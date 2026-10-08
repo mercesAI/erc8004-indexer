@@ -1,0 +1,213 @@
+# App data contract
+
+This is the only interface for the user-facing app. The app is a different repository. It connects to this Postgres database as `app_ro` and reads schema `read`. It does not write.
+
+Connection string, with the password from this repo's `APP_RO_PASSWORD`:
+
+```text
+postgres://app_ro:<APP_RO_PASSWORD>@127.0.0.1:5433/merces_data
+```
+
+On the machine that runs the collectors, the host is `127.0.0.1` and the port is the one in `DATABASE_URL` (local dev uses `5433`). Do not connect as `merces`. Do not call Ponder's GraphQL. Do not open the ops dashboard from the app.
+
+Check the boundary with `pnpm verify:read` in this repo. It must show `app_ro` can count `read.agents`, and permission denied for `mirror`, `erc8004`, `enrich`, and `ops`.
+
+## Identity
+
+An agent is the pair `(chain_id, agent_id)`.
+
+`chain_id` is an integer. `agent_id` is a numeric token id. In JSON, send `agent_id` as a string so a large id cannot be rounded. Current ids fit in a JavaScript number, and the string is still the right type.
+
+There is no surrogate id. Do not invent one.
+
+| chain_key | chain_name | chain_id |
+| --- | --- | --- |
+| ethereum | Ethereum | 1 |
+| optimism | Optimism | 10 |
+| bnb | BNB | 56 |
+| gnosis | Gnosis | 100 |
+| polygon | Polygon | 137 |
+| monad | Monad | 143 |
+| soneium | Soneium | 1868 |
+| abstract | Abstract | 2741 |
+| tempo | Tempo | 4217 |
+| arc | Arc | 5042 |
+| robinhood | Robinhood | 4663 |
+| base | Base | 8453 |
+| avalanche | Avalanche | 43114 |
+| celo | Celo | 42220 |
+| linea | Linea | 59144 |
+| mantle | Mantle | 5000 |
+| scroll | Scroll | 534352 |
+| arbitrum | Arbitrum | 42161 |
+
+`read.chains` lists those eighteen names. A row there does not mean the chain has been indexed. A chain is present in the product only when `read.agents` has rows for that `chain_id`. As of the first measured load, that was Base (`8453`), BNB (`56`), and Polygon (`137`). BNB can still be mid-backfill, so its agent count grows.
+
+Every product row also carries `chain_key` and `chain_name`. You do not need a local chain table.
+
+## Views
+
+All of these are views. `SELECT` only. They update as the collectors run. A query is allowed to see an agent before its registration file has been fetched.
+
+| View | One row is | Key |
+| --- | --- | --- |
+| `read.chains` | a known chain name | `chain_id` |
+| `read.agents` | the agent the UI should open | `(chain_id, agent_id)` |
+| `read.services` | one service from the registration file | `(chain_id, agent_id, name, endpoint)` |
+| `read.feedback` | one on-chain review | `(chain_id, agent_id, client_address, feedback_index)` |
+| `read.feedback_responses` | one reply appended to a review | `(chain_id, tx_hash, log_index)` |
+| `read.validations` | one validator request | `(chain_id, request_hash)` |
+| `read.registration_files` | the fetched file, including JSON | `(chain_id, agent_id)` |
+| `read.agent_metadata` | one on-chain metadata key | `(chain_id, agent_id, key)` |
+
+`read.agents` is the list and the header of a detail page. Join the other views on `chain_id` and `agent_id` when you need them. Do not `SELECT *` from `read.registration_files` in a list. Column `raw` is the whole file.
+
+### `read.agents`
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `chain_id` | integer | Chain id |
+| `chain_key` | text | `base`, `bnb`, `polygon`, … |
+| `chain_name` | text | `Base`, `BNB`, `Polygon`, … |
+| `agent_id` | numeric | Token id |
+| `owner` | text | Lowercase address. This is the current owner, not a history |
+| `agent_uri` | text | Whatever the chain stored. It is often not a URL |
+| `uri_kind` | text | `empty`, `ipfs`, `https`, `http`, `data`, or `invalid` |
+| `agent_wallet` | text or null | Lowercase address when the chain set one |
+| `registered_block` | numeric or null | Block of the registration |
+| `registered_at` | timestamptz or null | When it was registered, UTC |
+| `last_transfer_at` | timestamptz or null | Last owner change |
+| `uri_updated_at` | timestamptz or null | Last URI change |
+| `feedback_count` | integer | Non-revoked reviews. Revoked reviews are not included |
+| `last_feedback_at` | timestamptz or null | Newest non-revoked review |
+| `name` | text or null | From the file. Null until a fetch succeeds and the file has a name |
+| `description` | text or null | From the file |
+| `image` | text or null | From the file. Often a URL or another `ipfs://` URI |
+| `active` | boolean or null | From the file, when the file has a boolean |
+| `x402_support` | boolean or null | From the file |
+| `supported_trust` | text[] or null | From the file |
+| `fetch_status` | text or null | Null means not fetched yet. `ok` or `error` after a fetch |
+| `fetch_error` | text or null | Set when `fetch_status` is `error` |
+| `fetched_at` | timestamptz or null | Last fetch attempt |
+| `content_hash` | text or null | Hash of the file body when the fetch succeeded |
+
+`uri_kind` decides what the screen can promise:
+
+- `empty` means the chain registered the agent with a blank URI. There is no file. This is normal. `fetch_status` stays null.
+- `ipfs`, `https`, and `http` are fetched as URLs. `fetch_status` null means that has not happened yet.
+- `data` means the URI starts with `data:`. The enricher only parses `data:application/json` with a `;base64,` payload. Any other `data:` URI becomes `fetch_status = 'error'` and `fetch_error = 'unsupported uri scheme'`.
+- `invalid` means the token URI is not a file. The enricher still attempts it, then stores `fetch_status = 'error'` with `unsupported uri scheme`. Show the URI string. That error means the fetcher refused the string, not that the chain row is wrong.
+
+`fetch_status` null is not a failure. On a chain that just started indexing, most rows look like that. Show the owner and the URI kind, and leave the name blank.
+
+A later failed fetch does not wipe an earlier success. If `fetch_status` is `error` and `name` is still set, the name is from the previous good file. Prefer fields from a row whose `fetch_status` is `ok`. There is no `read.registration_files` row until the first attempt, so a missing row means "not tried yet", which is different from `fetch_status` null on the agent only when the join has not matched. On `read.agents`, null `fetch_status` means no attempt row.
+
+### Other views
+
+`read.services.name` is free text from the file. Frequent values include `A2A`, `MCP`, `web`, `Termix Platform`, and `unknown`. Do not treat the name as an enum. `endpoint` may be an empty string. `version` is text or null. `extra` is jsonb: the service object with `name`, `endpoint`, and `version` removed.
+
+`read.feedback` includes revoked rows. `is_revoked` is the flag. `value` is numeric, `value_decimals` is an integer, and `value_norm` is `value / 10^value_decimals` as a float for display, not for money. Also present: `tag2`, `endpoint`, `feedback_uri`, `feedback_hash`, `block_number`, `tx_hash`. `block_time` is timestamptz. `client_address` is lowercase.
+
+`read.feedback_responses` joins to a review by `(chain_id, agent_id, client_address, feedback_index)`, not by `tx_hash`. The reply itself is `responder`, `response_uri`, `response_hash`, and `block_time`.
+
+`read.validations.status` is the text `pending` or `completed`. `response` is the integer score, null while pending and set when completed. Also present: `validator_address`, `agent_id`, `request_uri`, `response_uri`, `response_hash`, `tag`, `requested_at` (nullable timestamptz), and `last_update`. There are very few of these.
+
+`read.registration_files` has one row per agent that has been attempted, not one row per agent. `raw` is jsonb when `fetch_status` is `ok`, and usually null on `error`. Also present: `http_status`, `next_retry_at`, and `attempts`. `fetch_error` is the same text as on the agent, for example `HTTP 403`.
+
+`read.agent_metadata.value_hex` is `0x` plus the lowercase hex of the on-chain bytes. `updated_at` is timestamptz. `key` is free text. `agentWallet` is the common key, and that address is already decoded onto `read.agents.agent_wallet` (a later transfer clears the agent column and does not delete the metadata row). Other keys, such as `displayName` or `profileURL`, are still raw bytes. Hex-decoding them once often yields another hex string, not the display text. Do not treat `value_hex` as UTF-8 without checking.
+
+## Queries
+
+Newest agents on one chain:
+
+```sql
+SELECT chain_id, chain_key, agent_id::text AS agent_id, owner, name,
+       uri_kind, feedback_count, fetch_status, registered_at
+FROM read.agents
+WHERE chain_id = 8453
+  AND registered_at IS NOT NULL
+ORDER BY registered_at DESC, agent_id DESC
+LIMIT 25;
+```
+
+Always filter `chain_id` on a list. At current size, the newest 25 agents on one chain is a few hundred milliseconds, because `feedback_count` is counted from reviews rather than copied from a cache.
+
+The next page uses the last row you showed. Both cursor values must be non-null. A row comparison with NULL does not match, so do not use a null `registered_at` as a cursor.
+
+```sql
+SELECT chain_id, chain_key, agent_id::text AS agent_id, owner, name,
+       uri_kind, feedback_count, fetch_status, registered_at
+FROM read.agents
+WHERE chain_id = 8453
+  AND registered_at IS NOT NULL
+  AND (registered_at, agent_id) < ($registered_at, $agent_id)
+ORDER BY registered_at DESC, agent_id DESC
+LIMIT 25;
+```
+
+Agents with `registered_at` null were seen through feedback or a transfer before the registration event. Query them on their own with `WHERE chain_id = $1 AND registered_at IS NULL`. Do not mix them into the cursor above. The current database has none of these rows. The column is still nullable.
+
+One agent:
+
+```sql
+SELECT *
+FROM read.agents
+WHERE chain_id = 8453 AND agent_id = 25975;
+```
+
+Its file, services, and reviews:
+
+```sql
+SELECT raw, fetch_status, fetch_error, fetched_at
+FROM read.registration_files
+WHERE chain_id = 8453 AND agent_id = 25975;
+
+SELECT name, endpoint, version
+FROM read.services
+WHERE chain_id = 8453 AND agent_id = 25975
+ORDER BY name, endpoint;
+
+SELECT client_address, feedback_index::text, value_norm, tag1, is_revoked, block_time
+FROM read.feedback
+WHERE chain_id = 8453 AND agent_id = 25975
+ORDER BY block_time DESC;
+```
+
+Name prefix on one chain. The search string is the user's text with `%` and `_` stripped:
+
+```sql
+SELECT chain_id, agent_id::text AS agent_id, name, registered_at
+FROM read.agents
+WHERE chain_id = 8453
+  AND lower(name) LIKE lower($1) || '%'
+ORDER BY registered_at DESC NULLS LAST
+LIMIT 25;
+```
+
+Chains that actually have agents:
+
+```sql
+SELECT chain_id, chain_key, chain_name, count(*)::int AS agents
+FROM read.agents
+GROUP BY 1, 2, 3
+ORDER BY agents DESC;
+```
+
+## What not to do
+
+- Do not read `erc8004`, `enrich`, `mirror`, or `ops`. `app_ro` is denied those schemas. `mirror` is a subgraph copy and runs ahead of the chain indexer, so its counts are a different population.
+- Do not use Ponder GraphQL at port `42069` as the product API. That port is one chain's indexer, and it is not a stable app schema.
+- Do not assume a name, a description, an image, or a service. Trust those fields when `fetch_status` is `ok`. If status is `error` and a name is still present, it is left over from an earlier success.
+- Do not treat `uri_kind = 'empty'` or `'invalid'` as a collector bug.
+- Do not paginate with a large `OFFSET`. Use the `(registered_at, agent_id)` cursor above.
+- Do not cache a chain's full agent list for a long time. Indexing appends rows, and a manual reset removes one chain and fills it again from its start block. `enrich` rows survive that reset.
+
+## How fresh the data is
+
+Three collectors write, continuously:
+
+- Ponder writes chain rows. A restart resumes from the checkpoint. It does not wipe a chain because the process restarted.
+- Enrich downloads registration files in the background. A new agent can sit with `fetch_status` null for a while.
+- The subgraph mirror is for sanity checks inside this repo. The app never sees it.
+
+Changing indexer code, or changing `START_BLOCK` for a chain, keeps the rows and refuses to start that chain until someone runs `pnpm reset:ponder --chain <key>` or `pnpm reset:ponder --all` in this repo. The app should keep reading whatever rows are still there.

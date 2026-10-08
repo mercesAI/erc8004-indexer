@@ -1,0 +1,27 @@
+{
+  "name": "merces-data",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.18.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "db:init": "tsx scripts/db-init.ts",
+    "block-at": "tsx scripts/block-at.ts",
+    "ops": "pnpm --filter @merces/ops build:ui && tsx packages/ops/src/supervisor.ts",
+    "ops:build": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops exec tsc --noEmit && pnpm --filter @merces/ops build:ui",
+    "sanity": "tsx packages/ops/src/cli/sanity.ts",
+    "verify:read": "tsx scripts/verify-read.ts",
+    "reset:ponder": "tsx scripts/reset-ponder.ts",
+    "typecheck": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops exec tsc --noEmit"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
