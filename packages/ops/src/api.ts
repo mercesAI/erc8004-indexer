@@ -67,7 +67,16 @@ export function startServer(manager: ProcessManager): void {
   const uiRoot = join(root, "packages/ops/dist/ui");
   const app = new Hono();
   // Basic auth is off while the dashboard stays on localhost. Restore with app.use("*", requireAuth).
+  // A custom header stops another website from submitting the stop/restart buttons.
   void requireAuth;
+  app.use("/api/*", async (c, next) => {
+    const host = c.req.header("host") ?? "";
+    if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) return c.json({ error: "bad host" }, 403);
+    if (c.req.method !== "GET" && c.req.method !== "HEAD" && c.req.header("x-merces-ops") !== "1") {
+      return c.json({ error: "missing x-merces-ops" }, 403);
+    }
+    await next();
+  });
 
   app.get("/api/overview", async (c) => {
     const snapshot = await latestSnapshot();

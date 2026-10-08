@@ -3,7 +3,10 @@ import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { BlockList, isIP } from "node:net";
-import { envInt, envString, HTTP_USER_AGENT } from "@merces/shared";
+import { envInt, envString } from "@merces/shared";
+
+const FETCH_USER_AGENT = "merces-indexer/1.0";
+const PUBLIC_IPFS_GATEWAY = /^https?:\/\/(?:ipfs\.io|dweb\.link|gateway\.pinata\.cloud|cloudflare-ipfs\.com|nftstorage\.link|w3s\.link|4everland\.io)\/ipfs\/(.+)$/i;
 
 const MAX_BYTES = 256 * 1024;
 
@@ -197,7 +200,7 @@ async function httpGet(raw: string, hops = 0): Promise<{ body: string; httpStatu
         method: "GET",
         headers: {
           accept: "application/json,text/plain,*/*",
-          "user-agent": HTTP_USER_AGENT,
+          "user-agent": FETCH_USER_AGENT,
           host: url.host,
         },
         servername: url.hostname,
@@ -252,20 +255,38 @@ async function httpGet(raw: string, hops = 0): Promise<{ body: string; httpStatu
     if (!result.location) throw new Error("fetch failed");
     return httpGet(new URL(result.location, url).href, hops + 1);
   }
-  if (result.status < 200 || result.status >= 300) throw new Error(`HTTP ${result.status}`);
+  if (result.status < 200 || result.status >= 300) {
+    const error = new Error(`HTTP ${result.status}`) as Error & { httpStatus: number };
+    error.httpStatus = result.status;
+    throw error;
+  }
   return { body: result.body, httpStatus: result.status };
+}
+
+function gatewayBase(): string {
+  const gateway = envString("IPFS_GATEWAY");
+  return gateway.endsWith("/") ? gateway : `${gateway}/`;
+}
+
+function gatewayFor(uri: string): string | null {
+  if (uri.startsWith("ipfs://")) {
+    const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
+    if (!path || path.split("/").some((part) => part === ".." || part === ".")) throw new Error("unsupported uri scheme");
+    return `${gatewayBase()}${path}`;
+  }
+  const match = uri.match(PUBLIC_IPFS_GATEWAY);
+  if (!match?.[1]) return null;
+  if (match[1].split("/").some((part) => part === ".." || part === ".")) throw new Error("unsupported uri scheme");
+  return `${gatewayBase()}${match[1]}`;
 }
 
 export async function resolveUri(uri: string): Promise<FetchResult> {
   try {
     let body: string;
     let httpStatus: number | null = null;
-    if (uri.startsWith("ipfs://")) {
-      const gateway = envString("IPFS_GATEWAY");
-      const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
-      if (path.split("/").some((part) => part === ".." || part === ".")) throw new Error("unsupported uri scheme");
-      const base = gateway.endsWith("/") ? gateway : `${gateway}/`;
-      const fetched = await httpGet(`${base}${path}`);
+    const rewritten = gatewayFor(uri);
+    if (rewritten) {
+      const fetched = await httpGet(rewritten);
       body = fetched.body;
       httpStatus = fetched.httpStatus;
     } else if (uri.startsWith("https://") || uri.startsWith("http://")) {
@@ -298,9 +319,22 @@ export async function resolveUri(uri: string): Promise<FetchResult> {
     return {
       ok: false,
       error: safeError(error),
-      httpStatus: null,
+      httpStatus: error instanceof Error && "httpStatus" in error && typeof error.httpStatus === "number" ? error.httpStatus : null,
     };
   }
 }
 
 export const RETRY_MS = [60 * 60 * 1000, 6 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000];
+
+export const TERMINAL_FETCH_ERRORS = [
+  "unsupported uri scheme",
+  "invalid json",
+  "blocked address",
+  "unstorable content",
+  "HTTP 404",
+  "HTTP 410",
+] as const;
+
+export function isTerminalFetchError(error: string): boolean {
+  return (TERMINAL_FETCH_ERRORS as readonly string[]).includes(error);
+}

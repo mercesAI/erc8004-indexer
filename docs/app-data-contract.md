@@ -114,7 +114,7 @@ A later failed fetch does not wipe an earlier success. If `fetch_status` is `err
 
 `read.registration_files` has one row per agent that has been attempted, not one row per agent. `raw` is jsonb when `fetch_status` is `ok`, and usually null on `error`. Also present: `http_status`, `next_retry_at`, and `attempts`. `fetch_error` is the same text as on the agent, for example `HTTP 403`.
 
-`read.agent_metadata.value_hex` is `0x` plus the lowercase hex of the on-chain bytes. `updated_at` is timestamptz. `key` is free text. `agentWallet` is the common key, and that address is already decoded onto `read.agents.agent_wallet` (a later transfer clears the agent column and does not delete the metadata row). Other keys, such as `displayName` or `profileURL`, are still raw bytes. Hex-decoding them once often yields another hex string, not the display text. Do not treat `value_hex` as UTF-8 without checking.
+`read.agent_metadata.value_hex` is the on-chain bytes as lowercase hex, including the `0x` prefix. Rows that were stored as the text of a hex string are unwrapped, so the column is the chain value either way. `updated_at` is timestamptz. `key` is free text. `agentWallet` is the common key, and that address is already decoded onto `read.agents.agent_wallet` (a later transfer clears the agent column and does not delete the metadata row). Other keys, such as `displayName` or `profileURL`, are still whatever bytes the chain stored. Do not assume `value_hex` is UTF-8 text.
 
 ## Queries
 

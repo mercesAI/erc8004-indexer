@@ -41,7 +41,7 @@ Alchemy's free plan only serves `eth_getLogs` for 10 blocks at a time (`ETH_GET_
 pnpm ops
 ```
 
-The dashboard is at `http://localhost:42070` (basic auth from `OPS_USER` / `OPS_PASSWORD`). Ponder's GraphQL is at `http://localhost:42069/graphql`.
+The dashboard is at `http://localhost:42070`. There is no login. The first chain's Ponder API is at `http://localhost:42069`. Later chains use 42081, 42082, and so on.
 
 The app repo should use:
 
@@ -83,8 +83,9 @@ Set `START_BLOCK_<CHAIN>` to the Identity deploy block from `chains.ts`. Restart
 
 - `pnpm db:init` applies `sql/001_schemas_roles.sql` and `sql/002_app_read.sql`, then refreshes `read`
 - `pnpm block-at --chain <key> --days-ago <n>` prints a block number
-- `pnpm ops` starts the supervisor and dashboard
-- `pnpm ops:build` typechecks packages and builds the dashboard
+- `pnpm ops` builds the dashboard, then starts the supervisor
+- `pnpm start` starts the supervisor without rebuilding the dashboard
+- `pnpm ops:build` typechecks every package, including Ponder, and builds the dashboard
 - `pnpm sanity` prints a sanity report and exits non-zero on any fail
 - `pnpm verify:read` checks that `app_ro` can read `read` and cannot read the collector schemas
 - `pnpm reset:ponder --chain <key>` drops that chain's schema after you type `yes`
@@ -92,13 +93,13 @@ Set `START_BLOCK_<CHAIN>` to the Identity deploy block from `chains.ts`. Restart
 
 ## Production
 
-On a VDS, a systemd unit runs `pnpm ops` with `NODE_ENV=production`. Reach the dashboard through an SSH tunnel (`ssh -L 42070:127.0.0.1:42070`). Nightly, dump the schemas a re-index cannot rebuild:
+On a VPS, a systemd unit runs `pnpm start` as the OS user `merces`. Reach the dashboard through an SSH tunnel (`ssh -L 42070:127.0.0.1:42070`). Nightly, dump the schemas a re-index cannot rebuild:
 
 ```ini
 [Service]
 WorkingDirectory=/opt/merces-data
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/pnpm ops
+ExecStart=/usr/bin/pnpm start
 Restart=on-failure
 ```
 

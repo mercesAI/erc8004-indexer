@@ -6,8 +6,17 @@ import {
   ValidationRegistryAbi,
   alchemyMaxRps,
   enabledChains,
+  envInt,
   registryAddress,
 } from "@merces/shared";
+
+function logRange(): number {
+  const value = envInt("ETH_GET_LOGS_BLOCK_RANGE", 10);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error("ETH_GET_LOGS_BLOCK_RANGE must be an integer >= 1");
+  }
+  return value;
+}
 
 const enabled = enabledChains();
 const requestsPerSecond = alchemyMaxRps();
@@ -21,7 +30,7 @@ const chains = Object.fromEntries(
       rpc: rateLimit(http(chain.rpcUrl), { requestsPerSecond, browser: false }),
       pollingInterval: 2_000,
       // Alchemy's free tier rejects eth_getLogs ranges above 10 blocks.
-      ethGetLogsBlockRange: Number(process.env.ETH_GET_LOGS_BLOCK_RANGE ?? "10"),
+      ethGetLogsBlockRange: logRange(),
     },
   ]),
 );

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { envInt, getPool, log } from "@merces/shared";
-import { resolveUri, RETRY_MS, type ParsedRegistration } from "./fetchUri.js";
+import { isTerminalFetchError, resolveUri, RETRY_MS, type ParsedRegistration } from "./fetchUri.js";
 
 type AgentTarget = {
   chain_id: number;
@@ -35,32 +35,53 @@ async function isPaused(): Promise<boolean> {
   return state.paused;
 }
 
-const SELECT_AGENTS = `
-  SELECT a.chain_id,
-         a.agent_id::text AS agent_id,
-         a.agent_uri,
-         CASE
-           WHEN r.agent_id IS NULL OR r.agent_uri IS DISTINCT FROM a.agent_uri THEN 0
-           ELSE COALESCE(r.attempts, 0)
-         END AS attempts
-  FROM erc8004.agents a
-  LEFT JOIN enrich.registration_files r
-    ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id
-  WHERE a.agent_uri <> ''
-    AND (
-      r.agent_id IS NULL
-      OR r.agent_uri IS DISTINCT FROM a.agent_uri
-      OR (r.fetch_status = 'error' AND r.next_retry_at IS NOT NULL AND r.next_retry_at <= now())
-    )
-  ORDER BY a.registered_at DESC NULLS LAST
-  LIMIT 200
+const DUE_AGENTS = `
+  WITH due AS (
+    SELECT a.chain_id,
+           a.agent_id::text AS agent_id,
+           a.agent_uri,
+           a.registered_at,
+           CASE
+             WHEN r.agent_id IS NULL OR r.agent_uri IS DISTINCT FROM a.agent_uri THEN 0
+             ELSE COALESCE(r.attempts, 0)
+           END AS attempts,
+           CASE
+             WHEN r.fetch_status = 'error' AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri THEN 0
+             WHEN r.agent_id IS NOT NULL AND r.agent_uri IS DISTINCT FROM a.agent_uri THEN 1
+             ELSE 2
+           END AS priority
+    FROM erc8004.agents a
+    LEFT JOIN enrich.registration_files r
+      ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id
+    WHERE a.agent_uri <> ''
+      AND COALESCE(r.error, '') NOT IN (
+        'unsupported uri scheme', 'invalid json', 'blocked address', 'unstorable content', 'HTTP 404', 'HTTP 410'
+      )
+      AND (
+        r.agent_id IS NULL
+        OR r.agent_uri IS DISTINCT FROM a.agent_uri
+        OR (r.fetch_status = 'error' AND r.next_retry_at IS NOT NULL AND r.next_retry_at <= now())
+      )
+  ),
+  ranked AS (
+    SELECT *, row_number() OVER (
+      PARTITION BY chain_id, (agent_uri LIKE 'data:%')
+      ORDER BY priority, registered_at DESC NULLS LAST
+    ) AS rn
+    FROM due
+  )
+  SELECT chain_id, agent_id, agent_uri, attempts
+  FROM ranked
+  WHERE (agent_uri LIKE 'data:%' AND rn <= 200)
+     OR (agent_uri NOT LIKE 'data:%' AND rn <= 40)
+  ORDER BY (agent_uri LIKE 'data:%') DESC, priority, registered_at DESC NULLS LAST
+  LIMIT 500
 `;
 
 async function queueDepth(): Promise<number> {
   try {
-    const result = await getPool().query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM (${SELECT_AGENTS.replace("LIMIT 200", "")}) q`,
-    );
+    const dueOnly = DUE_AGENTS.slice(0, DUE_AGENTS.indexOf(",\n  ranked AS"));
+    const result = await getPool().query<{ count: string }>(`${dueOnly}\nSELECT count(*)::text AS count FROM due`);
     state.queueDepth = Number(result.rows[0]?.count ?? 0);
   } catch {
     state.queueDepth = 0;
@@ -125,11 +146,25 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
     }
     return;
   }
-  const delay = RETRY_MS[Math.min(Math.max(attempts, 1) - 1, RETRY_MS.length - 1)] ?? RETRY_MS[3];
+  const terminal = isTerminalFetchError(result.error);
+  const delay = terminal ? null : (RETRY_MS[Math.min(Math.max(attempts, 1) - 1, RETRY_MS.length - 1)] ?? RETRY_MS[3]);
+  await getPool().query(
+    `DELETE FROM enrich.agent_services
+     WHERE chain_id = $1 AND agent_id = $2
+       AND EXISTS (
+         SELECT 1 FROM enrich.registration_files existing
+         WHERE existing.chain_id = $1 AND existing.agent_id = $2 AND existing.agent_uri IS DISTINCT FROM $3
+       )`,
+    [agent.chain_id, agent.agent_id, agent.agent_uri],
+  );
   await getPool().query(
     `INSERT INTO enrich.registration_files (
        chain_id, agent_id, agent_uri, fetch_status, http_status, error, fetched_at, next_retry_at, attempts
-     ) VALUES ($1, $2, $3, 'error', $4, $5, now(), now() + ($6::text || ' milliseconds')::interval, $7)
+     ) VALUES (
+       $1, $2, $3, 'error', $4, $5, now(),
+       CASE WHEN $6::text IS NULL THEN NULL ELSE now() + ($6::text || ' milliseconds')::interval END,
+       $7
+     )
      ON CONFLICT (chain_id, agent_id) DO UPDATE SET
        agent_uri = EXCLUDED.agent_uri,
        fetch_status = 'error',
@@ -137,8 +172,16 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
        error = EXCLUDED.error,
        fetched_at = now(),
        next_retry_at = EXCLUDED.next_retry_at,
-       attempts = EXCLUDED.attempts`,
-    [agent.chain_id, agent.agent_id, agent.agent_uri, result.httpStatus, result.error, String(delay), attempts],
+       attempts = EXCLUDED.attempts,
+       raw = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.raw ELSE NULL END,
+       content_hash = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.content_hash ELSE NULL END,
+       name = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.name ELSE NULL END,
+       description = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.description ELSE NULL END,
+       image = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.image ELSE NULL END,
+       active = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.active ELSE NULL END,
+       x402_support = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.x402_support ELSE NULL END,
+       supported_trust = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.supported_trust ELSE NULL END`,
+    [agent.chain_id, agent.agent_id, agent.agent_uri, result.httpStatus, result.error, delay == null ? null : String(delay), attempts],
   );
 }
 
@@ -179,7 +222,7 @@ async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "e
 }
 
 async function selectAgents(): Promise<AgentTarget[]> {
-  const result = await getPool().query<AgentTarget>(SELECT_AGENTS);
+  const result = await getPool().query<AgentTarget>(DUE_AGENTS);
   return result.rows;
 }
 

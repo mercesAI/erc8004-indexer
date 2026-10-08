@@ -8,8 +8,8 @@ Two different jobs:
 
 | Job | What it is | Where it stands |
 | --- | --- | --- |
-| Live tail | Index from `START_BLOCK_*` to the chain head, then follow new blocks | The current Base chunk is caught up. Ponder, the importer, and enrich are following the head. |
-| Full on-chain history | Set `START_BLOCK_BASE` to the Identity deploy block `41663783` and let Ponder rebuild `erc8004` | Not running. That is about 10.5 million Base blocks. |
+| Live tail | Index from `START_BLOCK_*` to the chain head, then follow new blocks | Base and Polygon are at the head. BNB is still backfilling. |
+| Full on-chain history | `START_BLOCK_*` is the Identity deploy block | Already how these chains were started. Changing that value later does not rebuild anything. |
 
 The Agent0 mirror is separate from Ponder. On Base it has already walked full history (agents and feedback) and is in incremental mode. A Ponder rebuild does not delete `mirror` or `enrich`.
 
@@ -47,14 +47,15 @@ Suggested first host: 2 vCPU, 4 GB RAM, 80 GB SSD. Add disk before turning on mo
 VPS
   PostgreSQL 16+     merces_data, role merces (CREATEROLE, owner)
   Node 22 + pnpm     /opt/merces-data
-  systemd            NODE_ENV=production  pnpm ops
-  listeners          127.0.0.1:42069  Ponder GraphQL
+  systemd            NODE_ENV=production  pnpm start
+  listeners          127.0.0.1:42069  first chain's Ponder
+                     127.0.0.1:42081+ later chains
                      127.0.0.1:42070  ops dashboard
                      127.0.0.1:42071  importer health
                      127.0.0.1:42072  enrich health
 ```
 
-Do not publish 42069 or 42070 on a public interface. Basic auth on the dashboard is not a substitute for a firewall.
+Do not publish those ports. The dashboard has no login. It only listens on localhost, and its Stop and Restart buttons require a header a normal browser page on another site cannot send.
 
 The user-facing app is a different repo. It connects as `app_ro` and may `SELECT` from schema `read` only. The contract is `docs/app-data-contract.md`.
 
@@ -73,11 +74,11 @@ CREATE ROLE merces LOGIN PASSWORD 'replace-me' CREATEROLE;
 CREATE DATABASE merces_data OWNER merces;
 SQL
 
-sudo mkdir -p /opt/merces-data
-sudo chown "$USER" /opt/merces-data
-git clone <this-repo> /opt/merces-data
+sudo useradd --system --create-home --shell /usr/sbin/nologin merces || true
+sudo git clone https://github.com/0xVitalii/merces-data.git /opt/merces-data
+sudo chown -R merces:merces /opt/merces-data
 cd /opt/merces-data
-cp .env.example .env
+sudo -u merces cp .env.example .env
 ```
 
 Fill `.env` on the server. Minimum:
@@ -89,23 +90,23 @@ CHAINS=base
 START_BLOCK_BASE=41663783          # full history, or a recent chunk
 ETH_GET_LOGS_BLOCK_RANGE=10        # 2000+ only on a plan that allows it
 ALCHEMY_MAX_RPS=8                  # raise with the paid plan
-DATABASE_SCHEMA=erc8004
+# Ignored by pnpm start. Each chain uses erc8004_<chain>. Do not run ponder dev.
 PONDER_PORT=42069
 OPS_PORT=42070
-OPS_USER=admin
-OPS_PASSWORD=<long random>
 SUBGRAPH_MIRROR_CHAINS=base
 GRAPH_API_KEY=...
 SUBGRAPH_ID_BASE=...
-IPFS_GATEWAY=https://ipfs.io/ipfs/
+IPFS_GATEWAY=https://gateway.pinata.cloud/ipfs/
 ```
 
 Registry addresses and RPC URLs are already documented in `.env.example`. RPC URLs may use `${ALCHEMY_API_KEY}`; the process expands that.
 
 ```bash
-pnpm install
-pnpm db:init
-pnpm ops:build
+sudo -u merces corepack enable
+sudo -u merces corepack prepare pnpm@10.18.0 --activate
+sudo -u merces pnpm install --frozen-lockfile
+sudo -u merces pnpm db:init
+sudo -u merces pnpm ops:build
 ```
 
 `pnpm db:init` creates the schemas and the `app_ro` role. Confirm the read-only login before pointing the app at it:
@@ -131,11 +132,11 @@ User=merces
 WorkingDirectory=/opt/merces-data
 Environment=NODE_ENV=production
 Environment=PATH=/usr/bin:/usr/local/bin
-ExecStart=/usr/bin/pnpm ops
+ExecStart=/usr/bin/pnpm start
 Restart=on-failure
 RestartSec=5
-# Keep the backfill alive across brief RPC failures. Ponder itself retries.
-TimeoutStopSec=20
+# How long systemd waits for the process to exit after stop. Not an RPC retry.
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -147,7 +148,7 @@ sudo systemctl enable --now merces-data
 sudo journalctl -u merces-data -f
 ```
 
-The supervisor runs `ponder start`, one process per chain, schema `erc8004_<chain>`. Restart resumes that chain's checkpoint. Adding a chain does not drop the others. Changing one chain's `START_BLOCK` rebuilds only that chain. Changing indexing code rebuilds every chain. `enrich` and `mirror` survive all of these.
+`pnpm start` runs the supervisor without rebuilding the dashboard. `pnpm ops` is the local command: it builds the UI, then starts the same supervisor. The supervisor runs `ponder start`, one process per chain, schema `erc8004_<chain>`. The first chain listens on `PONDER_PORT` (42069). The next chains listen on 42081, 42082, and so on. A restart resumes each chain's checkpoint. Adding a chain does not drop the others. Changing `START_BLOCK` or the indexing code does not rebuild anything. That chain refuses to start until `pnpm reset:ponder --chain <key>` or `pnpm reset:ponder --all`. `enrich` and `mirror` survive a reset.
 
 ## Dashboard
 
@@ -157,7 +158,7 @@ From a laptop:
 ssh -L 42070:127.0.0.1:42070 user@your-vps
 ```
 
-Open `http://127.0.0.1:42070`. The browser will ask for `OPS_USER` / `OPS_PASSWORD`.
+Open `http://127.0.0.1:42070`. There is no login prompt.
 
 Watch the Base card until lag stays under a few dozen blocks. That is the signal the backfill is finished and the process is only following the head.
 
@@ -194,8 +195,8 @@ If you would rather start clean on the server, skip the dump. Set `START_BLOCK_B
 
 1. Raise Alchemy until a 2,000-block `eth_getLogs` works. Set `ETH_GET_LOGS_BLOCK_RANGE` and `ALCHEMY_MAX_RPS` to match.
 2. Set `START_BLOCK_BASE=41663783` (and the matching deploy block for any other chain).
-3. Restart Ponder from the dashboard, or `sudo systemctl restart merces-data`.
-4. Expect `erc8004` to be rebuilt from that block. Leave the box up until lag is small.
+3. Run `pnpm reset:ponder --chain base` and type `yes`. Changing `START_BLOCK` alone keeps the old rows and refuses to start that chain.
+4. `sudo systemctl restart merces-data`. Leave the box up until lag is small.
 
 Adding Ethereum or another chain is `CHAINS=base,ethereum`, a `START_BLOCK_ETHEREUM`, and a restart. Each extra chain multiplies Alchemy traffic. Turn chains on one at a time.
 

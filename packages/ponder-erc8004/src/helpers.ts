@@ -1,3 +1,4 @@
+import type { Context } from "ponder:registry";
 import { rawEvent, agent } from "ponder:schema";
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -21,11 +22,7 @@ export function serializeArgs(args: object): Record<string, unknown> {
 }
 
 export async function writeRaw(
-  db: {
-    insert: (table: typeof rawEvent) => {
-      values: (values: Record<string, unknown>) => { onConflictDoNothing: () => Promise<unknown> };
-    };
-  },
+  db: Context["db"],
   chainId: number,
   event: LogEvent,
   contract: string,

@@ -143,6 +143,24 @@ export function refreshChainViews(): Promise<void> {
   return run;
 }
 
+async function readModelSignature(client: {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>;
+}): Promise<string> {
+  const columns = await client.query(
+    `SELECT table_schema, table_name, column_name, udt_schema, ordinal_position::text
+     FROM information_schema.columns
+     WHERE table_schema LIKE 'erc8004\\_%' ESCAPE '\\'
+       AND table_name = ANY($1::text[])
+     ORDER BY 1, 2, 5`,
+    [VIEW_TABLES],
+  );
+  const hash = createHash("sha256");
+  hash.update("read-model-v2");
+  hash.update(JSON.stringify(columns.rows));
+  hash.update(knownChains().map((chain) => `${chain.chainId}:${chain.key}:${chain.name}`).join(","));
+  return hash.digest("hex");
+}
+
 function sqlLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
@@ -151,7 +169,18 @@ async function refreshChainViewsLocked(): Promise<void> {
   const client = await getPool().connect();
   try {
     await client.query("SELECT pg_advisory_lock($1)", [VIEW_LOCK]);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ops.view_signature (
+        id integer PRIMARY KEY,
+        signature text NOT NULL
+      )
+    `);
+    const signature = await readModelSignature(client);
+    const stored = await client.query<{ signature: string }>("SELECT signature FROM ops.view_signature WHERE id = 1");
+    const current = await relationExists(client, "read.agents");
+    if (current && stored.rows[0]?.signature === signature) return;
     await client.query("BEGIN");
+    await client.query("SET LOCAL lock_timeout = '2s'");
     try {
       await client.query("CREATE SCHEMA IF NOT EXISTS erc8004");
       await client.query("CREATE SCHEMA IF NOT EXISTS read");
@@ -205,6 +234,11 @@ async function refreshChainViewsLocked(): Promise<void> {
       await client.query("ROLLBACK");
       throw error;
     }
+    await client.query(
+      `INSERT INTO ops.view_signature (id, signature) VALUES (1, $1)
+       ON CONFLICT (id) DO UPDATE SET signature = EXCLUDED.signature`,
+      [signature],
+    );
   } finally {
     await client.query("SELECT pg_advisory_unlock($1)", [VIEW_LOCK]).catch(() => undefined);
     client.release();
@@ -406,7 +440,11 @@ async function replaceReadModel(client: { query: (sql: string, params?: unknown[
       COALESCE(c.chain_name, 'Chain ' || m.chain_id::text) AS chain_name,
       m.agent_id,
       m.key,
-      CASE WHEN m.value IS NULL THEN NULL ELSE '0x' || encode(m.value, 'hex') END AS value_hex,
+      CASE
+        WHEN m.value IS NULL THEN NULL
+        WHEN octet_length(m.value) >= 2 AND substr(m.value, 1, 2) = decode('3078', 'hex') THEN convert_from(m.value, 'UTF8')
+        ELSE '0x' || encode(m.value, 'hex')
+      END AS value_hex,
       read.unix_seconds(m.updated_at) AS updated_at
     FROM erc8004.agent_metadata m
     LEFT JOIN read.chains c ON c.chain_id = m.chain_id

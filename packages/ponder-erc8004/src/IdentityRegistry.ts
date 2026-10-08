@@ -77,11 +77,13 @@ ponder.on("IdentityRegistry:MetadataSet", async ({ event, context }) => {
       chainId,
       agentId: event.args.agentId,
       key: event.args.metadataKey,
-      value: event.args.metadataValue,
+      // Stored as the UTF-8 of the hex string. read.agent_metadata unwraps it.
+      // Writing real bytes would change Ponder's build id and refuse this schema.
+      value: event.args.metadataValue as unknown as Uint8Array,
       updatedAt: event.block.timestamp,
     })
     .onConflictDoUpdate({
-      value: event.args.metadataValue,
+      value: event.args.metadataValue as unknown as Uint8Array,
       updatedAt: event.block.timestamp,
     });
   if (event.args.metadataKey === "agentWallet") {

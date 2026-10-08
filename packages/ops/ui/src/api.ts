@@ -2,6 +2,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: {
+      "x-merces-ops": "1",
       ...(init?.body ? { "content-type": "application/json" } : {}),
       ...init?.headers,
     },

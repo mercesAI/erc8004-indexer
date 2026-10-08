@@ -10,11 +10,12 @@
     "db:init": "tsx scripts/db-init.ts",
     "block-at": "tsx scripts/block-at.ts",
     "ops": "pnpm --filter @merces/ops build:ui && tsx packages/ops/src/supervisor.ts",
-    "ops:build": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops exec tsc --noEmit && pnpm --filter @merces/ops build:ui",
+    "start": "tsx packages/ops/src/supervisor.ts",
+    "ops:build": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/ponder-erc8004 exec tsc --noEmit && pnpm --filter @merces/ops build:ui",
     "sanity": "tsx packages/ops/src/cli/sanity.ts",
     "verify:read": "tsx scripts/verify-read.ts",
     "reset:ponder": "tsx scripts/reset-ponder.ts",
-    "typecheck": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops exec tsc --noEmit"
+    "typecheck": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/ponder-erc8004 exec tsc --noEmit"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["esbuild"]

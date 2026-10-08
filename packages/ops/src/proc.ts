@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { enabledChains, findRepoRoot } from "@merces/shared";
@@ -46,6 +47,56 @@ function resolveBin(root: string, name: string, pkgDir: string): string {
     if (existsSync(candidate)) return candidate;
   }
   throw new Error(`Cannot find the ${name} binary. Run pnpm install.`);
+}
+
+const execFileAsync = promisify(execFile);
+
+function retryDelay(failures: number): number {
+  return Math.min(5 * 60_000, 1000 * 2 ** Math.min(Math.max(failures, 1) - 1, 8));
+}
+
+function noteRestart(restarts: number[], startedAt: number | null): number[] {
+  const now = Date.now();
+  const stable = startedAt != null && now - startedAt >= 10 * 60 * 1000;
+  const kept = stable ? [] : restarts.filter((stamp) => now - stamp < 10 * 60 * 1000);
+  kept.push(now);
+  return kept;
+}
+
+const OWNED_PROCESS = ["ponder-erc8004", "importer-subgraph", "enrich-erc8004"];
+
+export async function reclaimIndexerPorts(ports: number[]): Promise<void> {
+  for (const port of ports) {
+    let pid = 0;
+    try {
+      const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+      pid = Number(stdout.trim().split("\n")[0]);
+    } catch {
+      continue;
+    }
+    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
+    let command = "";
+    try {
+      const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "command="]);
+      command = stdout;
+    } catch {
+      continue;
+    }
+    if (!OWNED_PROCESS.some((part) => command.includes(part))) {
+      recordLine("ops", "error", `port ${port} is used by another process; leaving it`);
+      continue;
+    }
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // The leftover process is already gone.
+      }
+    }
+    recordLine("ops", "info", `stopped leftover indexer ${pid} on port ${port}`);
+  }
 }
 
 function killGroup(pid: number, signal: NodeJS.Signals): void {
@@ -186,8 +237,8 @@ export class ProcessManager {
     void this.startPonder().catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       recordLine("ponder", "error", message);
-      if (this.ponderDesired !== "running" || attempt >= 4) return;
-      const delay = Math.min(30_000, 1000 * 2 ** attempt);
+      if (this.ponderDesired !== "running") return;
+      const delay = retryDelay(attempt + 1);
       setTimeout(() => {
         if (this.ponderDesired === "running") this.startPonderSoon(attempt + 1);
       }, delay);
@@ -243,7 +294,15 @@ export class ProcessManager {
 
   private spawnIndexer(indexer: ChainIndexer): void {
     const cwd = join(this.root, "packages/ponder-erc8004");
-    const command = resolveBin(this.root, "ponder", cwd);
+    let command: string;
+    try {
+      command = resolveBin(this.root, "ponder", cwd);
+    } catch (error) {
+      indexer.status = "backoff";
+      indexer.lastError = error instanceof Error ? error.message : String(error);
+      recordLine("ponder", "error", indexer.lastError);
+      return;
+    }
     const child = spawn(
       command,
       [
@@ -287,23 +346,20 @@ export class ProcessManager {
     });
     child.on("exit", (code, signal) => {
       if (indexer.child !== child) return;
+      const startedAt = indexer.startedAt;
       indexer.child = null;
       indexer.startedAt = null;
       if (this.ponderDesired === "stopped") {
         indexer.status = "stopped";
         return;
       }
-      const now = Date.now();
-      indexer.restarts = indexer.restarts.filter((stamp) => now - stamp < 10 * 60 * 1000);
-      indexer.restarts.push(now);
+      indexer.restarts = noteRestart(indexer.restarts, startedAt);
       indexer.lastError = `${indexer.chain} exited code=${code ?? "null"} signal=${signal ?? "null"}`;
-      if (indexer.restarts.length > 5) {
-        indexer.status = "failed";
-        recordLine("ponder", "error", `${indexer.chain} failed after 5 restarts in 10 minutes`);
-        return;
-      }
-      const delay = Math.min(30_000, 1000 * 2 ** (indexer.restarts.length - 1));
+      const delay = retryDelay(indexer.restarts.length);
       indexer.status = "backoff";
+      if (indexer.restarts.length > 5) {
+        recordLine("ponder", "error", `${indexer.chain} still failing; retrying in ${Math.round(delay / 1000)}s`);
+      }
       indexer.timer = setTimeout(() => {
         if (this.ponderDesired === "running" && !indexer.child) this.spawnIndexer(indexer);
       }, delay);
@@ -374,23 +430,20 @@ export class ProcessManager {
     });
     child.on("exit", (code, signal) => {
       if (runtime.child !== child) return;
+      const startedAt = runtime.startedAt;
       runtime.child = null;
       runtime.startedAt = null;
       if (runtime.desired === "stopped") {
         runtime.status = "stopped";
         return;
       }
-      const now = Date.now();
-      runtime.restarts = runtime.restarts.filter((stamp) => now - stamp < 10 * 60 * 1000);
-      runtime.restarts.push(now);
+      runtime.restarts = noteRestart(runtime.restarts, startedAt);
       runtime.lastError = `exited code=${code ?? "null"} signal=${signal ?? "null"}`;
-      if (runtime.restarts.length > 5) {
-        runtime.status = "failed";
-        recordLine(runtime.name, "error", `${runtime.name} failed after 5 restarts in 10 minutes`);
-        return;
-      }
-      const delay = Math.min(30_000, 1000 * 2 ** (runtime.restarts.length - 1));
+      const delay = retryDelay(runtime.restarts.length);
       runtime.status = "backoff";
+      if (runtime.restarts.length > 5) {
+        recordLine(runtime.name, "error", `${runtime.name} still failing; retrying in ${Math.round(delay / 1000)}s`);
+      }
       runtime.timer = setTimeout(() => {
         if (runtime.desired === "running" && !runtime.child) this.spawn(runtime);
       }, delay);

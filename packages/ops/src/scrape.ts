@@ -1,5 +1,5 @@
 import { alchemyMaxRps, enabledChains, getPool, getPublicClient, type EnabledChain } from "@merces/shared";
-import { pruneOpsRows } from "./logs.js";
+import { pruneOpsRows, recordLine } from "./logs.js";
 import { ponderPort, refreshChainViews } from "./schemas.js";
 
 type Metric = { name: string; labels: Record<string, string>; value: number };
@@ -135,7 +135,9 @@ async function chainPoint(chain: EnabledChain, statusBody: Record<string, unknow
 }
 
 export async function scrapeOnce(): Promise<MetricsPayload> {
-  await refreshChainViews().catch(() => undefined);
+  await refreshChainViews().catch((error: unknown) => {
+    recordLine("ops", "error", `view refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
   const enabled = enabledChains();
   const workers: Record<string, unknown> = {};
   for (const [name, healthPort] of [["importer", "42071"], ["enrich", "42072"]] as const) {
