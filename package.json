@@ -11,11 +11,13 @@
     "block-at": "tsx scripts/block-at.ts",
     "ops": "pnpm --filter @merces/ops build:ui && tsx packages/ops/src/supervisor.ts",
     "start": "tsx packages/ops/src/supervisor.ts",
-    "ops:build": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/ponder-erc8004 exec tsc --noEmit && pnpm --filter @merces/ops build:ui",
+    "ops:build": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/indexer-erc8004 exec tsc --noEmit && pnpm --filter @merces/ops build:ui",
     "sanity": "tsx packages/ops/src/cli/sanity.ts",
     "verify:read": "tsx scripts/verify-read.ts",
-    "reset:ponder": "tsx scripts/reset-ponder.ts",
-    "typecheck": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/ponder-erc8004 exec tsc --noEmit"
+    "reindex": "tsx scripts/reindex.ts",
+    "migrate:ponder": "tsx scripts/migrate-from-ponder.ts",
+    "cleanup:ponder": "tsx scripts/cleanup-ponder.ts",
+    "typecheck": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/indexer-erc8004 exec tsc --noEmit"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["esbuild"]

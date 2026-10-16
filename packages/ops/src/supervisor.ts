@@ -1,19 +1,36 @@
-import { enabledChains, getPool } from "@merces/shared";
+import { getPool } from "@merces/shared";
 import { startServer } from "./api.js";
-import { startLogWriter } from "./logs.js";
-import { ProcessManager, reclaimIndexerPorts } from "./proc.js";
+import { recordLine, startLogWriter } from "./logs.js";
+import { PROC_NAMES, ProcessManager, healthPort, reclaimIndexerPorts } from "./proc.js";
 import { startSanitySchedule } from "./sanity.js";
-import { ponderPort } from "./schemas.js";
+import { ensureReadModel } from "./schemas.js";
 import { startMetrics } from "./scrape.js";
 
-const ready = await getPool().query<{ name: string | null }>("SELECT to_regclass('ops.worker_control') AS name");
-if (!ready.rows[0]?.name) {
+const ready = await getPool().query<{ ops: string | null; tables: string | null; kind: string | null }>(`
+  SELECT to_regclass('ops.worker_control')::text AS ops,
+         to_regclass('erc8004.cursors')::text AS tables,
+         (SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'erc8004' AND c.relname = 'agents') AS kind
+`);
+const state = ready.rows[0];
+if (!state?.ops) {
   console.error("ops schema is missing. Run pnpm db:init");
   process.exit(1);
 }
+if (state.kind === "v") {
+  console.error("erc8004.agents is still the old Ponder view. Run pnpm migrate:ponder once, then start again.");
+  process.exit(1);
+}
+if (!state.tables) {
+  console.error("erc8004 tables are missing. Run pnpm db:init");
+  process.exit(1);
+}
+
+const { rebuilt } = await ensureReadModel();
+if (rebuilt) recordLine("ops", "info", "rebuilt the read views");
 
 const manager = new ProcessManager();
-await reclaimIndexerPorts([42071, 42072, ...enabledChains().map((_, index) => ponderPort(index))]);
+await reclaimIndexerPorts(PROC_NAMES.map(healthPort));
 startLogWriter();
 startMetrics();
 startSanitySchedule();

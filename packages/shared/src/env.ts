@@ -40,7 +40,8 @@ export function loadEnv(): string {
   const root = findRepoRoot();
   if (!loaded) {
     // Override inherited values so a stale shell export cannot shadow .env.
-    loadDotenv({ path: join(root, ".env"), override: true });
+    // MERCES_DOTENV points at another file, for a test or staging database.
+    loadDotenv({ path: process.env.MERCES_DOTENV || join(root, ".env"), override: true });
     loaded = true;
   }
   for (const [key, value] of Object.entries(process.env)) {

@@ -1,6 +1,7 @@
 import { getAddress } from "viem";
 import {
   IdentityRegistryAbi,
+  envInt,
   ReputationRegistryAbi,
   countScanAgents,
   enabledChains,
@@ -14,7 +15,6 @@ import {
   subgraphQuery,
   type EnabledChain,
 } from "@merces/shared";
-import { ponderPort } from "./schemas.js";
 
 export type SanityStatus = "pass" | "warn" | "fail";
 
@@ -108,26 +108,14 @@ export function startSanitySchedule(): void {
   }, sixHours);
 }
 
+/** The newest block the indexer has fully applied for this chain. Sanity reads the chain at this block. */
 async function indexedBlock(chain: EnabledChain): Promise<bigint | null> {
-  try {
-    const index = enabledChains().findIndex((item) => item.key === chain.key);
-    const port = index >= 0 ? ponderPort(index) : Number(process.env.PONDER_PORT ?? "42069");
-    const response = await fetch(`http://127.0.0.1:${port}/status`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (response.ok) {
-      const body = (await response.json()) as Record<string, { block?: { number?: number } | null }>;
-      const number = body[chain.key]?.block?.number;
-      if (typeof number === "number") return BigInt(number);
-    }
-  } catch {
-    // Fall through to the audit table.
-  }
   const result = await getPool().query<{ n: string | null }>(
-    "SELECT max(block_number)::text AS n FROM erc8004.raw_events WHERE chain_id = $1",
-    [chain.chainId],
+    "SELECT last_block::text AS n FROM erc8004.cursors WHERE chain = $1",
+    [chain.key],
   );
-  return result.rows[0]?.n == null ? null : BigInt(result.rows[0].n);
+  const value = result.rows[0]?.n;
+  return value == null || Number(value) < chain.startBlock ? null : BigInt(value);
 }
 
 async function lagRow(chain: EnabledChain): Promise<SanityRow> {
@@ -142,13 +130,21 @@ async function lagRow(chain: EnabledChain): Promise<SanityRow> {
     return row("lag", chain.key, chain.key, "warn", {}, "indexed block is not available yet");
   }
   const lag = head - indexed;
+  // The indexer polls on a schedule and stays `confirmations` blocks behind, so allow two intervals of blocks.
+  const updated = await getPool().query<{ age: string | null }>(
+    "SELECT extract(epoch FROM now() - last_run_at)::text AS age FROM erc8004.cursors WHERE chain = $1",
+    [chain.key],
+  );
+  const age = Number(updated.rows[0]?.age ?? Infinity);
+  const allowed = 2 * envInt(`INDEX_INTERVAL_SEC_${chain.key.toUpperCase()}`, envInt("INDEX_INTERVAL_SEC", 300));
+  const stale = !(age <= allowed);
   return row(
     "lag",
     chain.key,
     chain.key,
-    lag > 50n ? "warn" : "pass",
+    stale ? "warn" : "pass",
     { lag: { left: indexed.toString(), right: head.toString() } },
-    lag > 50n ? `${lag.toString()} blocks behind` : "within 50 blocks",
+    stale ? `last indexer run ${Number.isFinite(age) ? `${Math.round(age)}s` : "never"} ago; ${lag.toString()} blocks behind` : `${lag.toString()} blocks behind, indexer ran ${Math.round(age)}s ago`,
   );
 }
 
@@ -296,10 +292,6 @@ async function countsRow(chain: EnabledChain): Promise<SanityRow> {
       "SELECT count(*)::text AS n FROM erc8004.agents WHERE chain_id = $1 AND registered_block >= $2",
       [chain.chainId, chain.startBlock],
     );
-    const mirror = await getPool().query<{ n: string }>(
-      "SELECT count(*)::text AS n FROM mirror.agents WHERE chain_id = $1 AND created_at >= $2",
-      [chain.chainId, header.timestamp.toString()],
-    );
     let scan = "n/a";
     try {
       const total = await countScanAgents({
@@ -311,8 +303,7 @@ async function countsRow(chain: EnabledChain): Promise<SanityRow> {
       scan = error instanceof Error ? error.message : "error";
     }
     const postgres = pg.rows[0]?.n ?? "0";
-    const mirrored = mirror.rows[0]?.n ?? "0";
-    const same = postgres === mirrored && (scan === "n/a" || scan === postgres);
+    const same = scan === "n/a" || scan === postgres;
     return row(
       "counts",
       chain.key,
@@ -320,10 +311,9 @@ async function countsRow(chain: EnabledChain): Promise<SanityRow> {
       same ? "pass" : "warn",
       {
         postgres: { left: postgres, right: postgres },
-        mirror: { left: postgres, right: mirrored },
         scan: { left: postgres, right: scan },
       },
-      "agents registered inside the chunk",
+      "agents registered since START_BLOCK, compared with 8004scan",
     );
   } catch (error) {
     return row("counts", chain.key, chain.key, "warn", {}, error instanceof Error ? error.message : String(error));

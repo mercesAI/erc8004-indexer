@@ -83,7 +83,7 @@ export async function pruneOpsRows(): Promise<void> {
   const pool = getPool();
   await pool.query(
     `DELETE FROM ops.logs WHERE id IN (
-      SELECT id FROM ops.logs WHERE ts < now() - interval '7 days' LIMIT 5000
+      SELECT id FROM ops.logs WHERE ts < now() - interval '3 days' LIMIT 5000
     )`,
   );
   await pool.query("DELETE FROM ops.metrics_snapshots WHERE ts < now() - interval '7 days'");

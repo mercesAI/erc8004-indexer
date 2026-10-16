@@ -121,11 +121,7 @@ export function getChain(key: string): ChainSpec {
 export type EnabledChain = ChainSpec & { startBlock: number; rpcUrl: string };
 
 export function enabledChains(): EnabledChain[] {
-  // The supervisor sets INDEX_CHAIN so one Ponder process indexes one chain.
-  // loadEnv() re-reads .env with override, which would otherwise put every
-  // CHAINS entry back into every process.
-  const pinned = process.env.INDEX_CHAIN?.trim();
-  const keys = pinned ? [pinned] : envList("CHAINS");
+  const keys = envList("CHAINS");
   if (keys.length === 0) throw new Error("CHAINS is empty");
   return keys.map((key) => {
     const spec = getChain(key);
@@ -137,6 +133,20 @@ export function enabledChains(): EnabledChain[] {
       rpcUrl,
     };
   });
+}
+
+/**
+ * Blocks the indexer stays behind the head. Logs inside this window are not read yet, so a
+ * reorg shallower than this never reaches the tables and the indexer has no reorg handling.
+ */
+const CONFIRMATIONS: Partial<Record<ChainKey, number>> = {
+  ethereum: 12,
+  polygon: 64,
+  arbitrum: 240,
+};
+
+export function confirmationsFor(key: ChainKey): number {
+  return CONFIRMATIONS[key] ?? 30;
 }
 
 export type RegistryKind = "identity" | "reputation" | "validation";

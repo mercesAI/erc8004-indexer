@@ -1,0 +1,14 @@
+{
+  "name": "@merces/indexer-erc8004",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@merces/shared": "workspace:*",
+    "viem": "2.57.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "@types/pg": "^8.15.5",
+    "typescript": "^5.9.2"
+  }
+}

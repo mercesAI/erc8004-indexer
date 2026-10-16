@@ -8,6 +8,7 @@ import {
   CHAINS,
   enabledChains,
   envInt,
+  envList,
   findRepoRoot,
   getChain,
   getPool,
@@ -15,7 +16,7 @@ import {
 } from "@merces/shared";
 import { chainLabel } from "./schemas.js";
 import { tailLogs } from "./logs.js";
-import type { ProcessManager, ProcName } from "./proc.js";
+import { PROC_NAMES, type ProcessManager, type ProcName } from "./proc.js";
 import { runSanity } from "./sanity.js";
 
 const SECRET = /KEY|PASSWORD|PRIVATE|SECRET|DATABASE_URL|RPC_|GRAPH_API/;
@@ -100,7 +101,7 @@ export function startServer(manager: ProcessManager): void {
   app.post("/api/processes/:name/:action", async (c) => {
     const name = c.req.param("name") as ProcName;
     const action = c.req.param("action");
-    if (!["ponder", "importer", "enrich"].includes(name)) return c.json({ error: "unknown process" }, 400);
+    if (!PROC_NAMES.includes(name)) return c.json({ error: "unknown process" }, 400);
     if (action === "start") manager.start(name);
     else if (action === "stop") await manager.stop(name);
     else if (action === "restart") await manager.restart(name);
@@ -110,10 +111,14 @@ export function startServer(manager: ProcessManager): void {
 
   app.get("/api/workers", async (c) => c.json(await workersPayload()));
 
+  app.get("/api/chains", (c) =>
+    c.json(enabledChains().map((chain) => ({ key: chain.key, chainId: chain.chainId, label: chainLabel(chain.chainId) }))),
+  );
+
   app.post("/api/workers/:name/:action", async (c) => {
     const name = c.req.param("name");
     const action = c.req.param("action");
-    if (!["importer", "enrich"].includes(name) || !["pause", "resume"].includes(action)) {
+    if (!["indexer", "importer", "enrich"].includes(name) || !["pause", "resume"].includes(action)) {
       return c.json({ error: "unknown worker control" }, 400);
     }
     await getPool().query(
@@ -231,6 +236,7 @@ async function workersPayload(): Promise<Record<string, unknown>> {
     },
     health: (health?.workers as unknown) ?? null,
     chains: enabledChains().map((chain) => chain.key),
+    importerEnabled: envList("SUBGRAPH_MIRROR_CHAINS").length > 0,
   };
 }
 
@@ -246,7 +252,7 @@ function chainsInData(ids: number[]): { key: string; chainId: number; label: str
 }
 
 async function dataPayload(ownersChain: string): Promise<Record<string, unknown>> {
-  const tables = ["agents", "agent_metadata", "feedback", "feedback_responses", "validations", "raw_events"];
+  const tables = ["agents", "agent_metadata", "feedback", "feedback_responses", "validations"];
   const counts = [];
   const seenChainIds: number[] = [];
   for (const table of tables) {
@@ -278,8 +284,8 @@ async function dataPayload(ownersChain: string): Promise<Record<string, unknown>
   );
   const actions = await getPool().query(
     `SELECT chain_id, event_name, block_number::text AS block_number, block_time::text AS block_time, tx_hash
-     FROM erc8004.raw_events
-     ORDER BY block_time DESC NULLS LAST, log_index DESC
+     FROM erc8004.events
+     ORDER BY block_time DESC, log_index DESC
      LIMIT 15`,
   );
   const growth = await getPool().query(
@@ -348,9 +354,9 @@ async function searchAgents(chain: string, q: string, offset: number): Promise<R
 function settingsEntries(): { key: string; value: string }[] {
   const keys = [
     "CHAINS",
-    "DATABASE_SCHEMA",
     "DATABASE_URL",
-    "PONDER_PORT",
+    "INDEX_INTERVAL_SEC",
+    "ETH_GET_LOGS_BLOCK_RANGE",
     "OPS_PORT",
     "OPS_USER",
     "OPS_PASSWORD",
@@ -371,7 +377,7 @@ function settingsEntries(): { key: string; value: string }[] {
     "NODE_ENV",
   ];
   for (const chain of Object.values(CHAINS)) {
-    keys.push(chain.rpcEnvVar, chain.startBlockEnvVar, chain.subgraphEnvVar);
+    keys.push(chain.rpcEnvVar, chain.startBlockEnvVar, `INDEX_INTERVAL_SEC_${chain.key.toUpperCase()}`, chain.subgraphEnvVar);
   }
   return keys
     .filter((key, index) => keys.indexOf(key) === index)

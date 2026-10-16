@@ -1,4 +1,4 @@
-export { ZERO_ADDRESS, CHAINS, chainDisplayName, enabledChains, getChain, isChainKey, knownChains, lowerAddress, registryAddress, sameAddress } from "./chains.js";
+export { ZERO_ADDRESS, CHAINS, chainDisplayName, confirmationsFor, enabledChains, getChain, isChainKey, knownChains, lowerAddress, registryAddress, sameAddress } from "./chains.js";
 export type { ChainKey, ChainSpec, EnabledChain, RegistryKind } from "./chains.js";
 export { getPool, closePool } from "./db.js";
 export { envInt, envList, envString, findRepoRoot, loadEnv, reloadEnv } from "./env.js";

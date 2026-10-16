@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { closePool, findRepoRoot, getPool, loadEnv } from "../packages/shared/src/index.ts";
-import { refreshChainViews } from "../packages/ops/src/schemas.ts";
+import { ensureReadModel } from "../packages/ops/src/schemas.ts";
 
 loadEnv();
 
@@ -16,8 +16,16 @@ if (password.includes("\0") || password.includes("\n")) {
 }
 
 const root = findRepoRoot();
-const files = ["sql/001_schemas_roles.sql", "sql/002_app_read.sql"];
+const files = ["sql/001_schemas_roles.sql", "sql/002_app_read.sql", "sql/003_chain_tables.sql"];
 const pool = getPool();
+const legacy = await pool.query<{ relkind: string }>(
+  `SELECT c.relkind::text AS relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'erc8004' AND c.relname = 'agents'`,
+);
+if (legacy.rows[0]?.relkind === "v") {
+  console.error("erc8004.agents is still the old Ponder view. Stop the supervisor and run pnpm migrate:ponder once.");
+  process.exit(1);
+}
 for (const file of files) {
   let sql = readFileSync(join(root, file), "utf8");
   if (file.endsWith("001_schemas_roles.sql")) {
@@ -26,6 +34,6 @@ for (const file of files) {
   await pool.query(sql);
   console.log(`Applied ${file}`);
 }
-await refreshChainViews();
+await ensureReadModel();
 console.log("Refreshed read views");
 await closePool();

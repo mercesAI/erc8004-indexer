@@ -9,3 +9,19 @@ dist/
 !.env.example
 .pnpm-store/
 *.log
+
+# Database dumps and backups
+*.dump
+*.sql.gz
+*.backup
+
+# TLS material and keys
+*.pem
+*.key
+*.crt
+*.p12
+
+# Local editor and agent settings
+.claude/settings.local.json
+.vscode/
+.idea/

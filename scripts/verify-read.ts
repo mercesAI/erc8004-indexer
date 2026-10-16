@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { closePool, getPool, loadEnv } from "../packages/shared/src/index.ts";
-import { refreshChainViews } from "../packages/ops/src/schemas.ts";
+import { ensureReadModel } from "../packages/ops/src/schemas.ts";
 
 loadEnv();
-await refreshChainViews();
+await ensureReadModel();
 
 const admin = getPool();
 function asApp(sql: string): { ok: boolean; text: string } {
@@ -95,7 +95,7 @@ for (const row of explain.rows as { "QUERY PLAN": string }[]) console.log(row["Q
 
 const appCount = asApp("SELECT count(*)::int AS n FROM read.agents");
 console.log("app_ro agents", appCount.ok ? appCount.text : appCount.text);
-for (const rel of ["mirror.agents", "erc8004.agents", "erc8004.raw_events", "enrich.registration_files", "ops.logs"]) {
+for (const rel of ["mirror.agents", "erc8004.agents", "erc8004.events", "enrich.registration_files", "ops.logs"]) {
   const result = asApp(`SELECT 1 FROM ${rel} LIMIT 1`);
   const line = result.text.split("\n").find((item) => item.startsWith("ERROR") || item.includes("(1 row)")) ?? result.text.split("\n")[0];
   console.log(result.ok ? "ALLOW" : "DENY", rel, line);

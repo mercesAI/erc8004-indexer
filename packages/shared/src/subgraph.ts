@@ -2,8 +2,8 @@ import { getChain } from "./chains.js";
 import { envString } from "./env.js";
 import { log } from "./logger.js";
 
-export const HTTP_USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/** Sent to The Graph and 8004scan. Identifies this indexer honestly; both accept it. */
+export const HTTP_USER_AGENT = "merces-erc8004-indexer/1.0 (+https://github.com/0xVitalii/merces-data)";
 
 const PAGE_FIELDS = new Set(["agents", "agentRegistrationFiles", "feedbacks", "validations"]);
 

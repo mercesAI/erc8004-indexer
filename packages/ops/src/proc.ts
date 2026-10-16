@@ -2,11 +2,22 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { enabledChains, findRepoRoot } from "@merces/shared";
+import { envList, findRepoRoot } from "@merces/shared";
 import { recordLine } from "./logs.js";
-import { chainSchema, ponderPort, prepareChainIndexes } from "./schemas.js";
 
-export type ProcName = "ponder" | "importer" | "enrich";
+export type ProcName = "indexer" | "importer" | "enrich";
+
+export const PROC_NAMES: ProcName[] = ["indexer", "importer", "enrich"];
+
+const PROC_SPEC: Record<ProcName, { dir: string; healthPort: number }> = {
+  indexer: { dir: "indexer-erc8004", healthPort: 42073 },
+  importer: { dir: "importer-subgraph", healthPort: 42071 },
+  enrich: { dir: "enrich-erc8004", healthPort: 42072 },
+};
+
+export function healthPort(name: ProcName): number {
+  return PROC_SPEC[name].healthPort;
+}
 
 export type ProcView = {
   name: ProcName;
@@ -22,17 +33,6 @@ export type ProcView = {
 type Runtime = {
   name: ProcName;
   desired: "running" | "stopped";
-  status: ProcView["status"];
-  child: ChildProcess | null;
-  startedAt: number | null;
-  restarts: number[];
-  lastError: string | null;
-  timer: NodeJS.Timeout | null;
-};
-
-type ChainIndexer = {
-  chain: string;
-  port: number;
   status: ProcView["status"];
   child: ChildProcess | null;
   startedAt: number | null;
@@ -63,7 +63,9 @@ function noteRestart(restarts: number[], startedAt: number | null): number[] {
   return kept;
 }
 
-const OWNED_PROCESS = ["ponder-erc8004", "importer-subgraph", "enrich-erc8004"];
+// The children run as `tsx src/index.ts` with the package directory as cwd, so the command line alone
+// does not name the package. The supervisor passes the package name as an extra argument for this check.
+const OWNED_PROCESS = ["indexer-erc8004", "importer-subgraph", "enrich-erc8004"];
 
 export async function reclaimIndexerPorts(ports: number[]): Promise<void> {
   for (const port of ports) {
@@ -113,66 +115,40 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
 
 export class ProcessManager {
   private readonly root = findRepoRoot();
-  private readonly runtimes: Record<ProcName, Runtime>;
-  private readonly indexers = new Map<string, ChainIndexer>();
-  private ponderDesired: "running" | "stopped" = "stopped";
+  private readonly runtimes: Record<ProcName, Runtime> = {
+    indexer: this.blank("indexer"),
+    importer: this.blank("importer"),
+    enrich: this.blank("enrich"),
+  };
 
-  constructor() {
-    this.runtimes = {
-      ponder: this.blank("ponder"),
-      importer: this.blank("importer"),
-      enrich: this.blank("enrich"),
-    };
-  }
-
+  /** The importer only runs when SUBGRAPH_MIRROR_CHAINS names a chain; it can still be started from the dashboard. */
   startAll(): void {
-    this.start("ponder");
-    this.start("importer");
+    this.start("indexer");
     this.start("enrich");
+    if (envList("SUBGRAPH_MIRROR_CHAINS").length > 0) this.start("importer");
   }
 
   async stopAll(): Promise<void> {
-    await Promise.all([this.stop("ponder"), this.stop("importer"), this.stop("enrich")]);
+    await Promise.all(PROC_NAMES.map((name) => this.stop(name)));
   }
 
   snapshot(): ProcView[] {
-    return (Object.values(this.runtimes) as Runtime[]).map((runtime) => {
-      if (runtime.name !== "ponder") {
-        return {
-          name: runtime.name,
-          status: runtime.status,
-          desired: runtime.desired,
-          pid: runtime.child?.pid ?? null,
-          startedAt: runtime.startedAt,
-          uptimeSec: runtime.startedAt ? Math.floor((Date.now() - runtime.startedAt) / 1000) : null,
-          restarts: runtime.restarts.length,
-          lastError: runtime.lastError,
-        };
-      }
-      const indexers = [...this.indexers.values()];
-      const startedAt = indexers.reduce<number | null>((earliest, indexer) => {
-        if (indexer.startedAt == null) return earliest;
-        return earliest == null ? indexer.startedAt : Math.min(earliest, indexer.startedAt);
-      }, null);
-      const errors = indexers.map((indexer) => indexer.lastError).filter((error): error is string => Boolean(error));
+    return PROC_NAMES.map((name) => {
+      const runtime = this.runtimes[name];
       return {
-        name: "ponder",
-        status: this.ponderStatus(),
-        desired: this.ponderDesired,
-        pid: indexers.find((indexer) => indexer.child?.pid)?.child?.pid ?? null,
-        startedAt,
-        uptimeSec: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : null,
-        restarts: indexers.reduce((total, indexer) => total + indexer.restarts.length, 0),
-        lastError: errors[0] ?? null,
+        name: runtime.name,
+        status: runtime.status,
+        desired: runtime.desired,
+        pid: runtime.child?.pid ?? null,
+        startedAt: runtime.startedAt,
+        uptimeSec: runtime.startedAt ? Math.floor((Date.now() - runtime.startedAt) / 1000) : null,
+        restarts: runtime.restarts.length,
+        lastError: runtime.lastError,
       };
     });
   }
 
   start(name: ProcName): void {
-    if (name === "ponder") {
-      this.startPonderSoon();
-      return;
-    }
     const runtime = this.runtimes[name];
     runtime.desired = "running";
     runtime.restarts = [];
@@ -184,10 +160,6 @@ export class ProcessManager {
   }
 
   async stop(name: ProcName): Promise<void> {
-    if (name === "ponder") {
-      await this.stopPonder();
-      return;
-    }
     const runtime = this.runtimes[name];
     runtime.desired = "stopped";
     if (runtime.timer) clearTimeout(runtime.timer);
@@ -222,180 +194,14 @@ export class ProcessManager {
     };
   }
 
-  private ponderStatus(): ProcView["status"] {
-    const indexers = [...this.indexers.values()];
-    if (this.ponderDesired === "stopped" && indexers.every((indexer) => indexer.child == null)) return "stopped";
-    if (indexers.some((indexer) => indexer.status === "failed")) return "failed";
-    if (indexers.length > 0 && indexers.every((indexer) => indexer.status === "running")) return "running";
-    if (indexers.some((indexer) => indexer.status === "starting" || indexer.status === "backoff" || indexer.status === "running")) {
-      return "starting";
-    }
-    return this.ponderDesired === "running" ? "starting" : "stopped";
-  }
-
-  private startPonderSoon(attempt = 0): void {
-    void this.startPonder().catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      recordLine("ponder", "error", message);
-      if (this.ponderDesired !== "running") return;
-      const delay = retryDelay(attempt + 1);
-      setTimeout(() => {
-        if (this.ponderDesired === "running") this.startPonderSoon(attempt + 1);
-      }, delay);
-    });
-  }
-
-  private async startPonder(): Promise<void> {
-    this.ponderDesired = "running";
-    const plan = await prepareChainIndexes();
-    const wanted = new Set<string>(plan.chains.map((chain) => chain.key));
-    const blocked = new Map(plan.blocked.map((block) => [block.chain, block.reason]));
-    for (const [key, indexer] of this.indexers) {
-      if (!wanted.has(key)) await this.stopIndexer(indexer);
-    }
-    enabledChains().forEach((chain, index) => {
-      const reason = blocked.get(chain.key);
-      if (reason) {
-        const indexer = this.indexerFor(chain.key, index);
-        indexer.status = "failed";
-        indexer.lastError = reason;
-        return;
-      }
-      if (!wanted.has(chain.key)) return;
-      const indexer = this.indexerFor(chain.key, index);
-      if (indexer.child) return;
-      indexer.restarts = [];
-      indexer.lastError = null;
-      this.spawnIndexer(indexer);
-    });
-  }
-
-  private indexerFor(chain: string, index: number): ChainIndexer {
-    const existing = this.indexers.get(chain);
-    const indexer: ChainIndexer = existing ?? {
-      chain,
-      port: ponderPort(index),
-      status: "stopped",
-      child: null,
-      startedAt: null,
-      restarts: [],
-      lastError: null,
-      timer: null,
-    };
-    indexer.port = ponderPort(index);
-    this.indexers.set(chain, indexer);
-    return indexer;
-  }
-
-  private async stopPonder(): Promise<void> {
-    this.ponderDesired = "stopped";
-    await Promise.all([...this.indexers.values()].map((indexer) => this.stopIndexer(indexer)));
-  }
-
-  private spawnIndexer(indexer: ChainIndexer): void {
-    const cwd = join(this.root, "packages/ponder-erc8004");
-    let command: string;
-    try {
-      command = resolveBin(this.root, "ponder", cwd);
-    } catch (error) {
-      indexer.status = "backoff";
-      indexer.lastError = error instanceof Error ? error.message : String(error);
-      recordLine("ponder", "error", indexer.lastError);
-      return;
-    }
-    const child = spawn(
-      command,
-      [
-        "--log-format",
-        "json",
-        "start",
-        "--port",
-        String(indexer.port),
-        "--hostname",
-        "127.0.0.1",
-        "--schema",
-        chainSchema(indexer.chain),
-      ],
-      {
-        cwd,
-        env: {
-          ...process.env,
-          PROCESS_NAME: "ponder",
-          CHAINS: indexer.chain,
-          // .env reload inside the child must not expand this process back to every chain.
-          INDEX_CHAIN: indexer.chain,
-          DATABASE_SCHEMA: chainSchema(indexer.chain),
-        },
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    indexer.child = child;
-    indexer.startedAt = Date.now();
-    indexer.status = "running";
-    const consume = (fallback: string) => (chunk: Buffer) => {
-      for (const line of chunk.toString("utf8").split(/\r?\n/)) {
-        if (line.trim()) recordLine("ponder", fallback, `[${indexer.chain}] ${line}`);
-      }
-    };
-    child.stdout?.on("data", consume("info"));
-    child.stderr?.on("data", consume("error"));
-    child.on("error", (error) => {
-      indexer.lastError = `${indexer.chain}: ${error.message}`;
-      recordLine("ponder", "error", `[${indexer.chain}] ${error.message}`);
-    });
-    child.on("exit", (code, signal) => {
-      if (indexer.child !== child) return;
-      const startedAt = indexer.startedAt;
-      indexer.child = null;
-      indexer.startedAt = null;
-      if (this.ponderDesired === "stopped") {
-        indexer.status = "stopped";
-        return;
-      }
-      indexer.restarts = noteRestart(indexer.restarts, startedAt);
-      indexer.lastError = `${indexer.chain} exited code=${code ?? "null"} signal=${signal ?? "null"}`;
-      const delay = retryDelay(indexer.restarts.length);
-      indexer.status = "backoff";
-      if (indexer.restarts.length > 5) {
-        recordLine("ponder", "error", `${indexer.chain} still failing; retrying in ${Math.round(delay / 1000)}s`);
-      }
-      indexer.timer = setTimeout(() => {
-        if (this.ponderDesired === "running" && !indexer.child) this.spawnIndexer(indexer);
-      }, delay);
-    });
-  }
-
-  private async stopIndexer(indexer: ChainIndexer): Promise<void> {
-    if (indexer.timer) clearTimeout(indexer.timer);
-    const child = indexer.child;
-    if (!child?.pid) {
-      indexer.status = "stopped";
-      return;
-    }
-    killGroup(child.pid, "SIGTERM");
-    const exited = await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(indexer.child !== child), 4000);
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolve(true);
-      });
-    });
-    if (!exited && indexer.child?.pid) killGroup(indexer.child.pid, "SIGKILL");
-    indexer.status = "stopped";
-    indexer.startedAt = null;
-  }
-
   private command(name: ProcName): { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv } {
-    const env: NodeJS.ProcessEnv = { ...process.env, PROCESS_NAME: name };
-    const dir = name === "importer" ? "importer-subgraph" : "enrich-erc8004";
-    const cwd = join(this.root, "packages", dir);
-    env.HEALTH_PORT = name === "importer" ? "42071" : "42072";
+    const spec = PROC_SPEC[name];
+    const cwd = join(this.root, "packages", spec.dir);
     return {
       command: resolveBin(this.root, "tsx", cwd),
-      args: ["src/index.ts"],
+      args: ["src/index.ts", `--process=${spec.dir}`],
       cwd,
-      env,
+      env: { ...process.env, PROCESS_NAME: name, HEALTH_PORT: String(spec.healthPort) },
     };
   }
 
