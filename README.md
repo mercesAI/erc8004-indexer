@@ -21,7 +21,7 @@ Most indexers follow the chain block by block. For a catalog that gains a few th
 **Quick start**
 
 ```bash
-cp .env.example .env      # set DATABASE_URL, APP_RO_PASSWORD, ALCHEMY_API_KEY, CHAINS, START_BLOCK_<CHAIN>
+cp .env.example .env      # set DATABASE_URL, APP_RO_PASSWORD, ALCHEMY_API_KEY, CHAINS
 pnpm install
 pnpm db:init
 pnpm ops                  # dashboard at http://127.0.0.1:42070
@@ -160,7 +160,7 @@ pnpm ops
 
 `pnpm db:init` applies `sql/001_schemas_roles.sql`, `sql/002_app_read.sql`, and `sql/003_chain_tables.sql`, then builds the `read` views.
 
-Fill at least: `DATABASE_URL`, `APP_RO_PASSWORD`, `ALCHEMY_API_KEY`, `CHAINS`, and `START_BLOCK_<CHAIN>` for each enabled chain. RPC URLs may contain `${ALCHEMY_API_KEY}`; the loader expands that. `loadEnv()` in `packages/shared/src/env.ts` overrides variables already in the shell, so a stale `export START_BLOCK_BASE=...` does not win. `MERCES_DOTENV=/path/to/other.env` makes every process read another file instead, for a test database.
+Fill at least: `DATABASE_URL`, `APP_RO_PASSWORD`, `ALCHEMY_API_KEY`, and `CHAINS`. An empty `START_BLOCK_<CHAIN>` means full history from the registry's deploy block. RPC URLs may contain `${ALCHEMY_API_KEY}`; the loader expands that. `loadEnv()` in `packages/shared/src/env.ts` overrides variables already in the shell, so a stale `export START_BLOCK_BASE=...` does not win. `MERCES_DOTENV=/path/to/other.env` makes every process read another file instead, for a test database.
 
 The app connection string:
 
@@ -189,13 +189,12 @@ The chain key must already exist in `packages/shared/src/chains.ts` (`SPECS`). T
 
 ```text
 CHAINS=base,polygon,bnb,ethereum,scroll
-START_BLOCK_SCROLL=29432417
 RPC_SCROLL=https://...
 ```
 
-Restart the supervisor. The new chain gets a cursor at `START_BLOCK - 1` and catches up from there. A full history is one `eth_getLogs` per 2,000 blocks. Its cost depends on how many blocks the chain has, not on how fast it makes them, so fast chains are as cheap to follow as slow ones.
+Restart the supervisor. The new chain gets a cursor just before its start block and catches up from there. With `START_BLOCK_SCROLL` empty, the start block is the registry's deploy block, so the chain gets its full history. A full history is one `eth_getLogs` per 2,000 blocks. Its cost depends on how many blocks the chain has, not on how fast it makes them, so fast chains are as cheap to follow as slow ones.
 
-`START_BLOCK_<CHAIN>` for a chain you want in full is the `identityDeployBlock` in `chains.ts`. A larger block permanently misses agents registered before it, except as stubs when a later event mentions them.
+Set `START_BLOCK_<CHAIN>` only to skip history. A block after the deploy block permanently misses agents registered before it, except as stubs when a later event mentions them.
 
 ## Commands
 

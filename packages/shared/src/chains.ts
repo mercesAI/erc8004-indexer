@@ -129,7 +129,8 @@ export function enabledChains(): EnabledChain[] {
     if (!rpcUrl) throw new Error(`Set ${spec.rpcEnvVar} to enable ${key}`);
     return {
       ...spec,
-      startBlock: envInt(spec.startBlockEnvVar),
+      // Empty START_BLOCK_<CHAIN> means full history: the Identity registry's deploy block.
+      startBlock: envInt(spec.startBlockEnvVar, spec.identityDeployBlock),
       rpcUrl,
     };
   });

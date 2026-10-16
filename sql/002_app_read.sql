@@ -27,3 +27,8 @@ CREATE INDEX IF NOT EXISTS enrich_registration_name_lower
 
 CREATE INDEX IF NOT EXISTS enrich_services_name
   ON enrich.agent_services (name);
+
+-- app_ro may be reachable from the internet. Cap what one client can hold or run.
+ALTER ROLE app_ro CONNECTION LIMIT 30;
+ALTER ROLE app_ro SET statement_timeout = '10s';
+ALTER ROLE app_ro SET idle_in_transaction_session_timeout = '30s';
