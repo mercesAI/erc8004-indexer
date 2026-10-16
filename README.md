@@ -27,7 +27,7 @@ pnpm db:init
 pnpm ops                  # dashboard at http://127.0.0.1:42070
 ```
 
-Node 22 or newer, pnpm 10.18, Postgres 16. Deploying to a server is in [DEPLOY.md](DEPLOY.md).
+Node 22 or newer, pnpm 10.18, Postgres 16. Running it on a server is summarized under "Production" below.
 
 Do not treat schema `erc8004`, `mirror`, or `enrich` as an API. Those change when indexing changes. `read` is the stable surface.
 
@@ -235,7 +235,14 @@ viem 2.57.2 and hono 4.13.13 are pinned exactly. `pnpm typecheck` must stay gree
 
 ## Production
 
-Short version: OS user `merces`, `/opt/merces-data`, `ExecStart=/usr/bin/pnpm start`, dashboard only through `ssh -L 42070:127.0.0.1:42070`. Back up the whole database nightly; after the Ponder cleanup it is a few GB. The step-by-step, including creating the OS user, is [DEPLOY.md](DEPLOY.md).
+One small Linux VPS runs everything: 2 shared vCPUs, 8 GB RAM, and 40 GB disk are enough for five chains. Put it in the same region as the app.
+
+- **Service.** A system user owns the checkout and runs `pnpm start` under systemd with `Restart=on-failure`. `pnpm start` does not rebuild the dashboard; run `pnpm ops:build` after each update.
+- **Fresh start.** Leave `START_BLOCK_<CHAIN>` empty and every chain is read from the registry's deploy block. Five chains take one to two hours and under $2 of Alchemy compute units. Registration files take about a day.
+- **Dashboard.** It listens on `127.0.0.1` only. Reach it with `ssh -L 42070:127.0.0.1:42070 <server>`.
+- **App access.** Open Postgres for `app_ro` only, over TLS: `listen_addresses = '*'` plus `hostssl <db> app_ro 0.0.0.0/0 scram-sha-256` in `pg_hba.conf`, and the provider's firewall for port 5432. The app connects with `sslmode=require`. `app_ro` is capped at 30 connections and 10-second queries.
+- **Backups.** Dump the whole database nightly. The chain tables can be rebuilt from the RPC cheaply; `enrich` takes a day to refetch.
+- **Updates.** `git pull`, `pnpm install --frozen-lockfile`, `pnpm db:init`, `pnpm ops:build`, then restart the service. Every chain resumes from its cursor.
 
 ## RPC cost
 

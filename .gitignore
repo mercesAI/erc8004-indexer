@@ -25,3 +25,6 @@ dist/
 .claude/settings.local.json
 .vscode/
 .idea/
+
+# Operator manual, kept local
+DEPLOY.md
