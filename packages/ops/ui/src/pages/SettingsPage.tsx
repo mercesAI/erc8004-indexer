@@ -21,7 +21,7 @@ export function SettingsPage() {
           <thead><tr><th>Key</th><th>Value</th></tr></thead>
           <tbody>
             {entries.map((entry) => (
-              <tr key={entry.key}><td>{entry.key}</td><td className="mono">{entry.value || "—"}</td></tr>
+              <tr key={entry.key}><td>{entry.key}</td><td className="mono wrap">{entry.value || "—"}</td></tr>
             ))}
           </tbody>
         </table>

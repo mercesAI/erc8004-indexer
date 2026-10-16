@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { LongText } from "../LongText";
 import { api } from "../api";
 
 type Agent = {
@@ -25,6 +26,16 @@ type Feedback = {
 
 export function ExplorerPage() {
   const [chain, setChain] = useState("base");
+  const [chains, setChains] = useState<{ key: string; label: string; chainId: number }[]>([]);
+
+  useEffect(() => {
+    api<{ key: string; label: string; chainId: number }[]>("/api/chains")
+      .then((list) => {
+        setChains(list);
+        if (list.length > 0 && !list.some((item) => item.key === chain)) setChain(list[0]?.key ?? "base");
+      })
+      .catch(() => undefined);
+  }, []);
   const [q, setQ] = useState("");
   const [offset, setOffset] = useState(0);
   const [page, setPage] = useState<Page | null>(null);
@@ -55,7 +66,10 @@ export function ExplorerPage() {
     event.preventDefault();
     await api("/api/jobs/refetch", {
       method: "POST",
-      body: JSON.stringify({ chainId: selected?.chain_id ?? 8453, agentId: refetchId || selected?.agent_id }),
+      body: JSON.stringify({
+        chainId: selected?.chain_id ?? chains.find((item) => item.key === chain)?.chainId,
+        agentId: refetchId || selected?.agent_id,
+      }),
     });
   }
 
@@ -73,7 +87,9 @@ export function ExplorerPage() {
         <label>
           Chain
           <select className="btn ml-2" value={chain} onChange={(event) => { setChain(event.target.value); setOffset(0); }}>
-            <option>base</option>
+            {(chains.length > 0 ? chains : [{ key: "base", label: "Base (8453)", chainId: 8453 }]).map((item) => (
+              <option key={item.key} value={item.key}>{item.label}</option>
+            ))}
           </select>
         </label>
         <input className="btn min-w-80" aria-label="Search agents" value={q} onChange={(event) => setQ(event.target.value)} placeholder="agent id, owner, or name" />
@@ -86,7 +102,7 @@ export function ExplorerPage() {
             {page?.items.map((agent) => (
               <tr key={agent.agent_id}>
                 <td><button className="btn" type="button" onClick={() => void open(agent)}>{agent.agent_id}</button></td>
-                <td>{agent.name}</td>
+                <td className="wrap">{agent.name}</td>
                 <td className="mono">{agent.owner}</td>
                 <td>{agent.feedback_count}</td>
                 <td className="flex gap-2">
@@ -106,7 +122,7 @@ export function ExplorerPage() {
       {selected && (
         <section className="card">
           <h2 className="font-medium">Agent {selected.agent_id}</h2>
-          <p className="mono text-sm">{selected.agent_uri}</p>
+          <p className="mono text-sm"><LongText text={selected.agent_uri || "(empty URI)"} max={140} /></p>
           <form className="mt-2 flex gap-2" onSubmit={(event) => void refetch(event)}>
             <input className="btn" aria-label="Agent id to refetch" value={refetchId} onChange={(event) => setRefetchId(event.target.value)} placeholder={selected.agent_id} />
             <button className="btn" type="submit">Refetch registration</button>

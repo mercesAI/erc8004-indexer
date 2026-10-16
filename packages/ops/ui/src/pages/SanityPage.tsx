@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, formatWhen } from "../api";
+import { LongText } from "../LongText";
 
 type SanityRow = {
   check: string;
@@ -72,21 +73,40 @@ export function SanityPage() {
         </p>
       )}
       {[...groups.entries()].map(([check, rows]) => (
-        <section className="card overflow-auto" key={check}>
+        <section className="card" key={check}>
           <h2 className="mb-2 font-medium">{check}</h2>
-          <table>
-            <thead><tr><th>Status</th><th>Subject</th><th>Compared</th><th>Detail</th></tr></thead>
+          <table className="table-fixed">
+            <colgroup>
+              <col style={{ width: "4.5rem" }} />
+              <col style={{ width: "22%" }} />
+              <col />
+              <col style={{ width: "28%" }} />
+            </colgroup>
+            <thead><tr><th>Status</th><th>Subject</th><th>Compared (ours ↔ theirs)</th><th>Detail</th></tr></thead>
             <tbody>
               {rows.map((row) => (
                 <tr key={`${row.check}:${row.subject}:${row.detail}`}>
                   <td className={row.status}>{row.status}</td>
-                  <td className="mono">{row.subject}</td>
+                  <td className="mono wrap">{row.subject}</td>
                   <td className="mono">
-                    {Object.entries(row.fields).map(([name, field]) => (
-                      <div key={name}>{name}: {field.left} ↔ {field.right}</div>
-                    ))}
+                    {Object.entries(row.fields).map(([name, field]) => {
+                      // Only a failing or warning row has a meaningful difference; the lag row always differs.
+                      const same = field.left === field.right || row.status === "pass";
+                      return (
+                        <div key={name} className={same ? "" : "warn"}>
+                          <span className="muted">{name}{same ? "" : " differs"}:</span>{" "}
+                          {field.left === field.right ? (
+                            <LongText text={field.left || "—"} />
+                          ) : (
+                            <>
+                              <LongText text={field.left || "—"} /> ↔ <LongText text={field.right || "—"} />
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
                   </td>
-                  <td>{row.detail}</td>
+                  <td><LongText text={row.detail} max={120} /></td>
                 </tr>
               ))}
             </tbody>

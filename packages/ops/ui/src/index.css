@@ -110,3 +110,24 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; }
   white-space: nowrap;
   border: 0;
 }
+
+/* Long unbroken values (data: URIs, JSON, RPC errors) must wrap instead of widening the page. */
+.wrap { overflow-wrap: anywhere; word-break: break-word; }
+.longtext summary { cursor: pointer; overflow-wrap: anywhere; list-style: none; }
+.longtext summary::-webkit-details-marker { display: none; }
+.longtext summary::before { content: "▸ "; color: var(--muted); }
+.longtext[open] summary::before { content: "▾ "; }
+.textbox {
+  margin: 6px 0 0;
+  max-height: 14rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}

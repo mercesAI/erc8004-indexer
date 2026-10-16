@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, formatWhen } from "../api";
+import { api, formatNum, formatWhen } from "../api";
+import { LongText } from "../LongText";
 
 type Workers = {
   control: { worker: string; paused: boolean; updated_at: string }[];
@@ -10,9 +11,31 @@ type Workers = {
     pendingRetry: number;
     success: { hour: string; ok: number; error: number }[];
   };
-  health: Record<string, { queueDepth?: number; lastPass?: Record<string, unknown> }> | null;
+  health: {
+    indexer?: { paused?: boolean; chains?: Record<string, IndexerChain> };
+    importer?: { lastPass?: Record<string, unknown> };
+    enrich?: { queueDepth?: number };
+  } | null;
   chains: string[];
+  importerEnabled: boolean;
 };
+
+type IndexerChain = {
+  lastBlock: number | null;
+  headBlock: number | null;
+  confirmations: number;
+  intervalSec: number;
+  catchingUp: boolean;
+  lastRunAt: string | null;
+  lastError: string | null;
+  events: number;
+  rpcRequests: number;
+  rpcErrors: number;
+};
+
+function every(seconds: number): string {
+  return seconds % 3600 === 0 ? `${seconds / 3600}h` : seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds}s`;
+}
 
 function formatPass(pass: Record<string, unknown> | undefined): string {
   if (!pass) return "No completed pass yet.";
@@ -63,6 +86,8 @@ export function WorkersPage() {
     await load();
   }
 
+  const indexer = data?.control.find((row) => row.worker === "indexer");
+  const indexerChains = Object.entries(data?.health?.indexer?.chains ?? {});
   const importer = data?.control.find((row) => row.worker === "importer");
   const enrich = data?.control.find((row) => row.worker === "enrich");
   const enrichHealth = data?.health?.enrich;
@@ -74,44 +99,87 @@ export function WorkersPage() {
       {error && <p className="fail">{error}</p>}
       <section className="card">
         <div className="mb-2 flex items-center justify-between">
-          <h2 className="font-medium">Importer</h2>
-          <button className="btn" type="button" onClick={() => importer && void toggle("importer", importer.paused)}>
-            {importer?.paused ? "Resume" : "Pause"}
+          <h2 className="font-medium">Indexer</h2>
+          <button className="btn" type="button" onClick={() => indexer && void toggle("indexer", indexer.paused)}>
+            {indexer?.paused ? "Resume" : "Pause"}
           </button>
         </div>
-        <p className="text-sm">{formatPass(importerHealth?.lastPass)}</p>
-        <table className="mt-3">
-          <thead>
-            <tr><th>Chain</th><th>Entity</th><th>Mode</th><th>Cursor</th><th>Watermark</th></tr>
-          </thead>
-          <tbody>
-            {data?.cursors.map((cursor) => (
-              <tr key={`${cursor.chain}:${cursor.entity}`}>
-                <td>{cursor.chain}</td>
-                <td>{cursor.entity}</td>
-                <td>{cursor.mode}</td>
-                <td className="mono">{cursor.cursor.slice(0, 24)}</td>
-                <td className="mono">{cursor.watermark}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="mt-3 flex gap-2">
-          <label>
-            Chain
-            <select className="btn ml-2" value={chain} onChange={(event) => setChain(event.target.value)}>
-              {(data?.chains ?? ["base"]).map((item) => <option key={item}>{item}</option>)}
-            </select>
-          </label>
-          <label>
-            Entity
-            <select className="btn ml-2" value={entity} onChange={(event) => setEntity(event.target.value)}>
-              {["agents", "registration_files", "feedback", "validations"].map((item) => <option key={item}>{item}</option>)}
-            </select>
-          </label>
-          <button className="btn" type="button" onClick={() => void resetCursor()}>Reset cursor</button>
+        <p className="muted text-sm">
+          One eth_blockNumber and one eth_getLogs per 2,000 blocks per cycle. Behind is head minus the last applied block;
+          it includes the confirmation window, so it is never zero.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="mt-3">
+            <thead>
+              <tr><th>Chain</th><th>Every</th><th>Applied block</th><th>Head</th><th>Behind</th><th>Last run</th><th>Events</th><th>Requests</th><th>Last error</th></tr>
+            </thead>
+            <tbody>
+              {indexerChains.map(([key, item]) => (
+                <tr key={key}>
+                  <td>{key}{item.catchingUp && <span className="warn"> · catching up</span>}</td>
+                  <td>{every(item.intervalSec)}</td>
+                  <td className="mono">{formatNum(item.lastBlock)}</td>
+                  <td className="mono">{formatNum(item.headBlock)}</td>
+                  <td className="mono">{item.lastBlock != null && item.headBlock != null ? formatNum(item.headBlock - item.lastBlock) : "—"}</td>
+                  <td>{formatWhen(item.lastRunAt)}</td>
+                  <td className="mono">{formatNum(item.events)}</td>
+                  <td className="mono">{formatNum(item.rpcRequests)}{item.rpcErrors > 0 && <span className="fail"> · {item.rpcErrors} err</span>}</td>
+                  <td className="fail">{item.lastError ? <LongText text={item.lastError} max={60} /> : <span className="muted">—</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
+        {indexerChains.length === 0 && <p className="muted text-sm">Waiting for the indexer's first health report.</p>}
+        <p className="muted mt-2 text-xs">Counters restart from zero when the indexer restarts.</p>
       </section>
+      {data && !data.importerEnabled ? (
+        <section className="card">
+          <h2 className="font-medium">Importer</h2>
+          <p className="muted text-sm">Off. Set SUBGRAPH_MIRROR_CHAINS and restart to mirror the Agent0 subgraph into schema mirror.</p>
+        </section>
+      ) : (
+      <section className="card">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="font-medium">Importer</h2>
+            <button className="btn" type="button" onClick={() => importer && void toggle("importer", importer.paused)}>
+              {importer?.paused ? "Resume" : "Pause"}
+            </button>
+          </div>
+          <p className="text-sm">{formatPass(importerHealth?.lastPass)}</p>
+          <table className="mt-3">
+            <thead>
+              <tr><th>Chain</th><th>Entity</th><th>Mode</th><th>Cursor</th><th>Watermark</th></tr>
+            </thead>
+            <tbody>
+              {data?.cursors.map((cursor) => (
+                <tr key={`${cursor.chain}:${cursor.entity}`}>
+                  <td>{cursor.chain}</td>
+                  <td>{cursor.entity}</td>
+                  <td>{cursor.mode}</td>
+                  <td className="mono">{cursor.cursor.slice(0, 24)}</td>
+                  <td className="mono">{cursor.watermark}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-3 flex gap-2">
+            <label>
+              Chain
+              <select className="btn ml-2" value={chain} onChange={(event) => setChain(event.target.value)}>
+                {(data?.chains ?? ["base"]).map((item) => <option key={item}>{item}</option>)}
+              </select>
+            </label>
+            <label>
+              Entity
+              <select className="btn ml-2" value={entity} onChange={(event) => setEntity(event.target.value)}>
+                {["agents", "registration_files", "feedback", "validations"].map((item) => <option key={item}>{item}</option>)}
+              </select>
+            </label>
+            <button className="btn" type="button" onClick={() => void resetCursor()}>Reset cursor</button>
+          </div>
+        </section>
+      )}
       <section className="card">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="font-medium">Enrich</h2>

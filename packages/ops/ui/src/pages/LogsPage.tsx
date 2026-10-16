@@ -30,7 +30,7 @@ export function LogsPage() {
       <h1 className="text-xl font-semibold">Logs</h1>
       <div className="flex flex-wrap gap-2">
         <select className="btn" aria-label="Process" value={processName} onChange={(event) => setProcessName(event.target.value)}>
-          {["all", "ponder", "importer", "enrich"].map((item) => <option key={item}>{item}</option>)}
+          {["all", "indexer", "importer", "enrich", "ops"].map((item) => <option key={item}>{item}</option>)}
         </select>
         <select className="btn" aria-label="Level" value={level} onChange={(event) => setLevel(event.target.value)}>
           {["all", "error", "warn", "info", "debug"].map((item) => <option key={item}>{item}</option>)}
@@ -41,7 +41,7 @@ export function LogsPage() {
           Follow
         </label>
       </div>
-      <pre className="card mono max-h-[70vh] overflow-auto whitespace-pre-wrap">
+      <pre className="card mono wrap max-h-[70vh] overflow-auto whitespace-pre-wrap">
         {rows.map((row) => (
           <div key={row.id} className={row.level === "error" ? "fail" : row.level === "warn" ? "warn" : ""}>
             {formatWhen(row.ts)} {row.process} {row.level} {row.line}
