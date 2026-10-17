@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { serve } from "@hono/node-server";
+import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { Hono, type MiddlewareHandler } from "hono";
-import { timingSafeEqual } from "node:crypto";
+import { Hono } from "hono";
 import {
   CHAINS,
+  alchemyMaxRps,
   enabledChains,
   envInt,
   envList,
@@ -21,40 +21,26 @@ import { runSanity } from "./sanity.js";
 
 const SECRET = /KEY|PASSWORD|PRIVATE|SECRET|DATABASE_URL|RPC_|GRAPH_API/;
 
-function safeEqual(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
-
+/**
+ * Values shown on the Settings page. A secret-looking key that holds a URL keeps only its origin,
+ * because providers put the key in the path (Alchemy, Infura, QuickNode) or the query string.
+ */
 function mask(key: string, value: string): string {
-  if (!SECRET.test(key)) return value;
+  if (!value) return value;
+  // Any URL may carry a token in its path or query (gateways, RPC providers), whatever its key is called.
   if (value.includes("://")) {
-    return value
-      .replace(/\/\/([^:/]+):([^@]+)@/, "//$1:***@")
-      .replace(/\/v2\/[^/?#]+/g, "/v2/***")
-      .replace(/\/api\/[^/]+\/subgraphs/g, "/api/***/subgraphs");
+    try {
+      const url = new URL(value);
+      const rest = url.pathname !== "/" || url.search ? "/***" : "";
+      return `${url.protocol}//${url.username ? `${url.username}:***@` : ""}${url.host}${rest}`;
+    } catch {
+      return "***";
+    }
   }
+  if (!SECRET.test(key)) return value;
   if (value.length <= 4) return "***";
   return `${value.slice(0, 2)}***${value.slice(-2)}`;
 }
-
-const requireAuth: MiddlewareHandler = async (c, next) => {
-  const user = process.env.OPS_USER ?? "admin";
-  const password = process.env.OPS_PASSWORD ?? "change-me";
-  const header = c.req.header("authorization") ?? "";
-  const encoded = header.startsWith("Basic ") ? header.slice(6) : "";
-  const decoded = encoded ? Buffer.from(encoded, "base64").toString("utf8") : "";
-  const split = decoded.indexOf(":");
-  const gotUser = split === -1 ? "" : decoded.slice(0, split);
-  const gotPass = split === -1 ? "" : decoded.slice(split + 1);
-  if (!encoded || !safeEqual(gotUser, user) || !safeEqual(gotPass, password)) {
-    c.header("WWW-Authenticate", 'Basic realm="merces-ops"');
-    return c.text("Unauthorized", 401);
-  }
-  await next();
-};
 
 async function latestSnapshot(): Promise<Record<string, unknown> | null> {
   const result = await getPool().query<{ payload: Record<string, unknown> }>(
@@ -63,13 +49,13 @@ async function latestSnapshot(): Promise<Record<string, unknown> | null> {
   return result.rows[0]?.payload ?? null;
 }
 
-export function startServer(manager: ProcessManager): void {
+/** Resolves once the dashboard port is bound. Rejects when another supervisor already holds it. */
+export function startServer(manager: ProcessManager): Promise<void> {
   const root = findRepoRoot();
   const uiRoot = join(root, "packages/ops/dist/ui");
   const app = new Hono();
-  // Basic auth is off while the dashboard stays on localhost. Restore with app.use("*", requireAuth).
-  // A custom header stops another website from submitting the stop/restart buttons.
-  void requireAuth;
+  // The dashboard has no login. It binds to 127.0.0.1, refuses a foreign Host header (DNS rebinding),
+  // and requires a custom header on writes, which a form on another site cannot send.
   app.use("/api/*", async (c, next) => {
     const host = c.req.header("host") ?? "";
     if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) return c.json({ error: "bad host" }, 403);
@@ -93,7 +79,7 @@ export function startServer(manager: ProcessManager): void {
     const step = Math.max(1, Math.floor(result.rows.length / 240));
     const points = result.rows.filter((_, index) => index % step === 0 || index === result.rows.length - 1);
     return c.json({
-      alchemyMaxRps: alchemyNumber(),
+      alchemyMaxRps: alchemyMaxRps(),
       points: points.map((row) => ({ ts: row.ts, chains: row.payload.chains ?? [] })),
     });
   });
@@ -197,13 +183,18 @@ export function startServer(manager: ProcessManager): void {
   });
 
   const port = envInt("OPS_PORT", 42070);
-  serve({ fetch: app.fetch, hostname: "127.0.0.1", port });
-  console.log(JSON.stringify({ level: "info", msg: "ops listening", url: `http://127.0.0.1:${port}` }));
+  return new Promise((resolve, reject) => {
+    const server: ServerType = serve({ fetch: app.fetch, hostname: "127.0.0.1", port }, () => {
+      console.log(JSON.stringify({ level: "info", msg: "ops listening", url: `http://127.0.0.1:${port}` }));
+      resolve();
+    });
+    server.on("error", (error: NodeJS.ErrnoException) => {
+      reject(error.code === "EADDRINUSE" ? new Error(`port ${port} is taken; is another supervisor running?`) : error);
+    });
+  });
 }
 
-function alchemyNumber(): number {
-  return Number(process.env.ALCHEMY_MAX_RPS ?? "20");
-}
+
 
 async function workersPayload(): Promise<Record<string, unknown>> {
   const control = await getPool().query("SELECT worker, paused, updated_at FROM ops.worker_control ORDER BY worker");
@@ -358,8 +349,6 @@ function settingsEntries(): { key: string; value: string }[] {
     "INDEX_INTERVAL_SEC",
     "ETH_GET_LOGS_BLOCK_RANGE",
     "OPS_PORT",
-    "OPS_USER",
-    "OPS_PASSWORD",
     "ALCHEMY_MAX_RPS",
     "SUBGRAPH_MIRROR_CHAINS",
     "IMPORTER_INTERVAL_SEC",

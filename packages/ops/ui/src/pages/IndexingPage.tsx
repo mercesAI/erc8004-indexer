@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api, formatWhen } from "../api";
 
 type Point = {
@@ -15,7 +15,6 @@ type Point = {
 
 export function IndexingPage() {
   const [points, setPoints] = useState<Point[]>([]);
-  const [rps, setRps] = useState(20);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -23,7 +22,6 @@ export function IndexingPage() {
       api<{ points: Point[]; alchemyMaxRps: number }>("/api/indexing?hours=6")
         .then((body) => {
           setPoints(body.points);
-          setRps(body.alchemyMaxRps);
           setError(null);
         })
         .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
@@ -37,9 +35,10 @@ export function IndexingPage() {
   const rows = points.map((point) => {
     const row: Record<string, string | number | null> = { ts: formatWhen(point.ts) };
     for (const chain of point.chains) {
-      row[`${chain.chain}:lag`] = chain.lag;
-      row[`${chain.chain}:events`] = Number(chain.eventsPerSec.toFixed(2));
-      row[`${chain.chain}:rpc`] = Number(chain.rpcPerSec.toFixed(2));
+      // The indexer works in bursts once per interval, so per-minute rates read better than per-second.
+      row[`${chain.chain}:behind`] = chain.lag;
+      row[`${chain.chain}:events`] = Math.round(chain.eventsPerSec * 60);
+      row[`${chain.chain}:rpc`] = Math.round(chain.rpcPerSec * 60);
       row[`${chain.chain}:errors`] = chain.errorCount;
     }
     return row;
@@ -48,6 +47,10 @@ export function IndexingPage() {
   return (
     <div className="flex flex-col gap-4">
       <h1 className="text-xl font-semibold">Indexing</h1>
+      <p className="muted text-sm">
+        Per chain over the last 6 hours. "behind" is head minus the applied block and never reaches zero: the indexer stays a
+        confirmation window behind and moves once per interval. Events and requests are per minute, from the indexer's counters.
+      </p>
       {error && <p className="fail">{error}</p>}
       {chains.map((chain) => (
         <section className="card" key={chain}>
@@ -60,11 +63,10 @@ export function IndexingPage() {
                 <YAxis stroke="var(--muted)" />
                 <Tooltip />
                 <Legend />
-                <ReferenceLine y={rps} stroke="var(--warn)" strokeDasharray="4 4" label="Alchemy cap" />
-                <Line dataKey={`${chain}:lag`} name="lag" stroke="var(--fail)" dot={false} />
-                <Line dataKey={`${chain}:events`} name="events/s" stroke="var(--pass)" dot={false} />
-                <Line dataKey={`${chain}:rpc`} name="rpc/s" stroke="var(--accent)" dot={false} />
-                <Line dataKey={`${chain}:errors`} name="errors" stroke="var(--muted)" dot={false} />
+                <Line dataKey={`${chain}:behind`} name="blocks behind" stroke="var(--fail)" dot={false} />
+                <Line dataKey={`${chain}:events`} name="events/min" stroke="var(--pass)" dot={false} />
+                <Line dataKey={`${chain}:rpc`} name="requests/min" stroke="var(--accent)" dot={false} />
+                <Line dataKey={`${chain}:errors`} name="rpc errors" stroke="var(--muted)" dot={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>

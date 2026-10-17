@@ -73,7 +73,12 @@ export async function reclaimIndexerPorts(ports: number[]): Promise<void> {
     try {
       const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
       pid = Number(stdout.trim().split("\n")[0]);
-    } catch {
+    } catch (error) {
+      // lsof exits 1 when nothing listens. A missing lsof binary looks the same without this check.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        recordLine("ops", "error", "lsof is not installed; leftover children from a hard kill cannot be found. apt install lsof");
+        return;
+      }
       continue;
     }
     if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
@@ -165,6 +170,7 @@ export class ProcessManager {
     if (runtime.timer) clearTimeout(runtime.timer);
     const child = runtime.child;
     if (!child?.pid) {
+      runtime.child = null;
       runtime.status = "stopped";
       return;
     }
@@ -223,18 +229,18 @@ export class ProcessManager {
     runtime.child = child;
     runtime.startedAt = Date.now();
     runtime.status = "running";
-    const consume = (fallback: string) => (chunk: Buffer) => {
-      for (const line of chunk.toString("utf8").split(/\r?\n/)) {
-        if (line.trim()) recordLine(runtime.name, fallback, line);
-      }
+    // A JSON log line can arrive split across two chunks; keep the tail until its newline shows up.
+    const consume = (fallback: string) => {
+      let rest = "";
+      return (chunk: Buffer) => {
+        const lines = (rest + chunk.toString("utf8")).split(/\r?\n/);
+        rest = lines.pop() ?? "";
+        for (const line of lines) if (line.trim()) recordLine(runtime.name, fallback, line);
+      };
     };
     child.stdout?.on("data", consume("info"));
     child.stderr?.on("data", consume("error"));
-    child.on("error", (error) => {
-      runtime.lastError = error.message;
-      recordLine(runtime.name, "error", error.message);
-    });
-    child.on("exit", (code, signal) => {
+    const gone = (reason: string) => {
       if (runtime.child !== child) return;
       const startedAt = runtime.startedAt;
       runtime.child = null;
@@ -244,7 +250,7 @@ export class ProcessManager {
         return;
       }
       runtime.restarts = noteRestart(runtime.restarts, startedAt);
-      runtime.lastError = `exited code=${code ?? "null"} signal=${signal ?? "null"}`;
+      runtime.lastError = reason;
       const delay = retryDelay(runtime.restarts.length);
       runtime.status = "backoff";
       if (runtime.restarts.length > 5) {
@@ -253,7 +259,14 @@ export class ProcessManager {
       runtime.timer = setTimeout(() => {
         if (runtime.desired === "running" && !runtime.child) this.spawn(runtime);
       }, delay);
+    };
+    child.on("error", (error) => {
+      recordLine(runtime.name, "error", error.message);
+      // A spawn that never started (binary missing after a pnpm install) emits error and no exit.
+      if (!child.pid) gone(`could not start: ${error.message}`);
+      else runtime.lastError = error.message;
     });
+    child.on("exit", (code, signal) => gone(`exited code=${code ?? "null"} signal=${signal ?? "null"}`));
   }
 
   private waitExit(runtime: Runtime, child: ChildProcess, ms: number): Promise<boolean> {

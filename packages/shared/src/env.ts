@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config as loadDotenv } from "dotenv";
+import { resetRedaction } from "./redact.js";
 
 export function findRepoRoot(): string {
   const starts = [process.cwd()];
@@ -33,6 +34,7 @@ let loaded = false;
 
 export function reloadEnv(): string {
   loaded = false;
+  resetRedaction();
   return loadEnv();
 }
 

@@ -141,7 +141,7 @@ export function enabledChains(): EnabledChain[] {
  * reorg shallower than this never reaches the tables and the indexer has no reorg handling.
  */
 const CONFIRMATIONS: Partial<Record<ChainKey, number>> = {
-  ethereum: 12,
+  ethereum: 32,
   polygon: 64,
   arbitrum: 240,
 };

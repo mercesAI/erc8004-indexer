@@ -1,6 +1,7 @@
-import { alchemyMaxRps, enabledChains, getPool } from "@merces/shared";
+import { alchemyMaxRps, enabledChains, envInt, getPool } from "@merces/shared";
 import { pruneOpsRows } from "./logs.js";
 import { healthPort } from "./proc.js";
+import { ensureReadModel } from "./schemas.js";
 
 /**
  * Every METRICS_INTERVAL_SEC the supervisor reads the workers' health endpoints and the row counts,
@@ -93,6 +94,10 @@ function chainPoint(key: string, chainId: number, startBlock: number, health: Ch
 }
 
 export async function scrapeOnce(): Promise<MetricsPayload> {
+  // One hash and two lookups when nothing changed; a rebuild that failed at startup is retried here.
+  await ensureReadModel({ wait: false }).catch((error: unknown) => {
+    console.error(JSON.stringify({ level: "error", msg: "read views not rebuilt yet", error: String(error) }));
+  });
   const workers: Record<string, unknown> = {};
   for (const name of ["indexer", "importer", "enrich"] as const) {
     try {
@@ -120,11 +125,18 @@ export async function scrapeOnce(): Promise<MetricsPayload> {
 }
 
 export function startMetrics(): void {
-  const interval = Number(process.env.METRICS_INTERVAL_SEC ?? "15") * 1000;
+  const interval = Math.max(1, envInt("METRICS_INTERVAL_SEC", 15)) * 1000;
+  let running = false;
   const tick = () => {
-    scrapeOnce().catch((error: unknown) => {
-      console.error(JSON.stringify({ level: "error", msg: "metrics scrape failed", error: String(error) }));
-    });
+    if (running) return;
+    running = true;
+    scrapeOnce()
+      .catch((error: unknown) => {
+        console.error(JSON.stringify({ level: "error", msg: "metrics scrape failed", error: String(error) }));
+      })
+      .finally(() => {
+        running = false;
+      });
   };
   tick();
   setInterval(tick, interval);

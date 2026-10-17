@@ -3,7 +3,7 @@
 -- mirror: importer-subgraph. enrich: enrich-erc8004. ops: the supervisor.
 -- app_ro starts with these grants. sql/002_app_read.sql revokes them.
 -- After both files, app_ro can SELECT schema read only. It cannot read ops.
--- db:init replaces __APP_RO_PASSWORD__ before applying this file.
+-- db:init replaces __APP_RO_PASSWORD__ with a SCRAM-SHA-256 verifier of APP_RO_PASSWORD before applying this file.
 
 CREATE SCHEMA IF NOT EXISTS erc8004;
 CREATE SCHEMA IF NOT EXISTS mirror;

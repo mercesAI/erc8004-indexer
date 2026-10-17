@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { decodeEventLog, type Abi } from "viem";
+import { decodeEventLog, toEventSelector, type Abi, type AbiEvent } from "viem";
 import {
   IdentityRegistryAbi,
   ReputationRegistryAbi,
@@ -29,6 +29,17 @@ const ABIS: Record<RegistryKind, Abi> = {
   validation: ValidationRegistryAbi as Abi,
 };
 
+type Selector = { kind: RegistryKind; name: string; handled: boolean };
+
+/** topic0 of every event each registry ABI declares, keyed by registry so a shared name like Transfer stays apart. */
+const SELECTORS = new Map<string, Selector>();
+for (const [kind, abi] of Object.entries(ABIS) as [RegistryKind, Abi][]) {
+  for (const item of abi) {
+    if (item.type !== "event") continue;
+    SELECTORS.set(`${kind}:${toEventSelector(item as AbiEvent)}`, { kind, name: item.name, handled: HANDLED[item.name] === kind });
+  }
+}
+
 export function registryAddresses(): Record<RegistryKind, string> {
   return {
     identity: registryAddress("identity"),
@@ -46,16 +57,20 @@ export type ChainEvent = {
   txHash: string;
 };
 
+export type Decoded = { events: ChainEvent[]; skipped: number; unknown: string[] };
+
 /**
- * Decode raw logs from the three registries. Logs of events this indexer does not store
- * (Approval, Upgraded, ...) are skipped. Throws if a log has no block timestamp, because every
- * table needs one and fetching block headers is exactly the cost this indexer exists to avoid.
+ * Decode raw logs from the three registries. Events the ABI declares but this indexer does not store
+ * (Approval, Upgraded, ...) are skipped. A handled event that fails to decode throws, so the cursor
+ * does not move past it: that is what a registry upgrade that changes an event looks like. A topic
+ * the ABI does not know at all is skipped and reported in `unknown`, so the operator hears about it.
  */
-export function decodeLogs(logs: RawLog[], addresses: Record<RegistryKind, string>): { events: ChainEvent[]; skipped: number } {
+export function decodeLogs(logs: RawLog[], addresses: Record<RegistryKind, string>): Decoded {
   const kindByAddress = new Map<string, RegistryKind>(
     (Object.entries(addresses) as [RegistryKind, string][]).map(([kind, address]) => [address, kind]),
   );
   const events: ChainEvent[] = [];
+  const unknown = new Set<string>();
   let skipped = 0;
   for (const log of logs) {
     const kind = kindByAddress.get(log.address.toLowerCase());
@@ -63,18 +78,26 @@ export function decodeLogs(logs: RawLog[], addresses: Record<RegistryKind, strin
       skipped += 1;
       continue;
     }
+    const topic0 = log.topics[0]?.toLowerCase();
+    const known = topic0 ? SELECTORS.get(`${kind}:${topic0}`) : undefined;
+    if (!known) {
+      unknown.add(`${kind}:${topic0 ?? "anonymous"}`);
+      skipped += 1;
+      continue;
+    }
+    if (!known.handled) {
+      skipped += 1;
+      continue;
+    }
     let decoded: { eventName: string; args: unknown };
     try {
       decoded = decodeEventLog({ abi: ABIS[kind], data: log.data, topics: log.topics as [`0x${string}`, ...`0x${string}`[]] });
-    } catch {
-      skipped += 1;
-      continue;
+    } catch (error) {
+      throw new Error(
+        `cannot decode ${known.name} in block ${BigInt(log.blockNumber)} tx ${log.transactionHash}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    if (HANDLED[decoded.eventName] !== kind) {
-      skipped += 1;
-      continue;
-    }
-    if (!log.blockTimestamp) throw new Error(`eth_getLogs returned no blockTimestamp (block ${BigInt(log.blockNumber)})`);
+    if (!log.blockTimestamp) throw new Error(`log in block ${BigInt(log.blockNumber)} has no blockTimestamp`);
     events.push({
       name: decoded.eventName,
       args: decoded.args as Record<string, unknown>,
@@ -85,7 +108,7 @@ export function decodeLogs(logs: RawLog[], addresses: Record<RegistryKind, strin
     });
   }
   events.sort((a, b) => (a.blockNumber === b.blockNumber ? a.logIndex - b.logIndex : a.blockNumber < b.blockNumber ? -1 : 1));
-  return { events, skipped };
+  return { events, skipped, unknown: [...unknown] };
 }
 
 /** Postgres text cannot hold NUL. Strings from the chain occasionally contain one. */
@@ -101,10 +124,14 @@ function num(value: unknown): string {
   return typeof value === "bigint" ? value.toString() : String(value);
 }
 
+/** Addresses and hashes are stored lowercase everywhere, including inside the JSON copy of the args. */
 function jsonArgs(args: Record<string, unknown>): string {
   return JSON.stringify(args, (_key, value: unknown) => {
     if (typeof value === "bigint") return value.toString();
-    if (typeof value === "string") return value.replaceAll("\u0000", "");
+    if (typeof value === "string") {
+      if (/^0x([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(value)) return value.toLowerCase();
+      return value.replaceAll("\u0000", "");
+    }
     return value;
   });
 }
@@ -141,7 +168,7 @@ export async function applyEvents(client: pg.PoolClient, chainId: number, events
            VALUES ($1, $2, $3, $4, $5, $6, 0)
            ON CONFLICT (chain_id, agent_id) DO UPDATE SET
              owner = EXCLUDED.owner, agent_uri = EXCLUDED.agent_uri,
-             registered_block = EXCLUDED.registered_block, registered_at = EXCLUDED.registered_at`,
+             registered_block = EXCLUDED.registered_block, registered_at = EXCLUDED.registered_at, updated_at = now()`,
           [chainId, num(a.agentId), addr(a.owner), text(a.agentURI), event.blockNumber.toString(), time],
         );
         break;
@@ -159,7 +186,7 @@ export async function applyEvents(client: pg.PoolClient, chainId: number, events
           `INSERT INTO erc8004.agents (chain_id, agent_id, owner, agent_uri, last_transfer_at, feedback_count)
            VALUES ($1, $2, $3, '', $4, 0)
            ON CONFLICT (chain_id, agent_id) DO UPDATE SET
-             owner = EXCLUDED.owner, agent_wallet = NULL, last_transfer_at = EXCLUDED.last_transfer_at`,
+             owner = EXCLUDED.owner, agent_wallet = NULL, last_transfer_at = EXCLUDED.last_transfer_at, updated_at = now()`,
           [chainId, num(a.tokenId), addr(a.to), time],
         );
         break;
@@ -169,7 +196,7 @@ export async function applyEvents(client: pg.PoolClient, chainId: number, events
           `INSERT INTO erc8004.agents (chain_id, agent_id, owner, agent_uri, uri_updated_at, feedback_count)
            VALUES ($1, $2, '${ZERO_ADDRESS}', $3, $4, 0)
            ON CONFLICT (chain_id, agent_id) DO UPDATE SET
-             agent_uri = EXCLUDED.agent_uri, uri_updated_at = EXCLUDED.uri_updated_at`,
+             agent_uri = EXCLUDED.agent_uri, uri_updated_at = EXCLUDED.uri_updated_at, updated_at = now()`,
           [chainId, num(a.agentId), text(a.newURI), time],
         );
         break;
@@ -183,7 +210,7 @@ export async function applyEvents(client: pg.PoolClient, chainId: number, events
         );
         if (a.metadataKey === "agentWallet") {
           await client.query(SEED_AGENT, [chainId, num(a.agentId)]);
-          await client.query("UPDATE erc8004.agents SET agent_wallet = $3 WHERE chain_id = $1 AND agent_id = $2", [
+          await client.query("UPDATE erc8004.agents SET agent_wallet = $3, updated_at = now() WHERE chain_id = $1 AND agent_id = $2", [
             chainId,
             num(a.agentId),
             decodeAgentWallet(hex),

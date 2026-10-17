@@ -92,9 +92,11 @@ The views are rebuilt only when a hash of their SQL (stored in `ops.view_signatu
 | `ETH_GET_LOGS_BLOCK_RANGE` | 2000 | Blocks per `eth_getLogs`. A range the provider rejects is halved and retried |
 | `ALCHEMY_MAX_RPS` | 20 | Requests per second for the whole indexer, all chains together |
 
-A cycle is one `eth_blockNumber`, then one `eth_getLogs` per 2,000 new blocks covering all three registries at once. Logs come back with `blockTimestamp`, which is the only block field the tables need, so the indexer never downloads a block or a transaction. A chain that is behind is caught up in the same way, four ranges in flight, applied strictly in block order.
+A cycle is one `eth_blockNumber`, then one `eth_getLogs` per 2,000 new blocks covering all three registries at once. Alchemy, Erigon, and Reth return `blockTimestamp` with every log, which is the only block field the tables need, so the indexer never downloads a block or a transaction. With a provider that leaves it out, the indexer fetches one block header per block that holds an event and logs a warning once. A chain that is behind is caught up in the same way, four ranges in flight, applied strictly in block order.
 
-The indexer stays a few blocks behind the head: 12 on Ethereum, 64 on Polygon, 240 on Arbitrum, 30 elsewhere (`confirmationsFor` in `packages/shared/src/chains.ts`). Logs inside that window are not read yet, so a reorg shallower than it never reaches the tables, and there is no reorg handling. Data in `read` is therefore up to one interval plus that window behind the chain: about 5 minutes for most chains, about an hour for Monad.
+Any JSON-RPC provider works. When one rejects a range as too large (Alchemy's "Response is too big", Infura's "more than 10000 results", a free tier's block cap), the indexer halves the range and tries both halves, down to one block. Quota and rate-limit errors are not treated that way: the cycle fails, the error is shown on the dashboard, and the chain retries with backoff.
+
+The indexer stays a few blocks behind the head: 32 on Ethereum, 64 on Polygon, 240 on Arbitrum, 30 elsewhere (`confirmationsFor` in `packages/shared/src/chains.ts`). Logs inside that window are not read yet, so a reorg shallower than it never reaches the tables, and there is no reorg handling. Data in `read` is therefore up to one interval plus that window behind the chain: about 5 minutes for most chains, about an hour for Monad.
 
 Each 2,000-block range is applied in one transaction together with its cursor in `erc8004.cursors`, so a crash never leaves half a range. Every write is an upsert, so replaying a range changes nothing. Events stored: `Registered`, `Transfer`, `URIUpdated`, `MetadataSet`, `NewFeedback`, `FeedbackRevoked`, `ResponseAppended`, `ValidationRequest`, `ValidationResponse`. `agents.feedback_count` and `last_feedback_at` count non-revoked feedback only; they are recomputed for every agent a range touches.
 
@@ -107,15 +109,17 @@ pnpm reindex --chain base --from 4100000 # keep the rows and replay from that bl
 
 Both ask you to type `yes` in a terminal. The running indexer picks up the moved cursor on its next cycle. `enrich` is not touched. A full re-read is cheap: one `eth_getLogs` per 2,000 blocks, about 5,500 calls for all of Base's history.
 
-Changing `START_BLOCK_<CHAIN>` after a chain has a cursor does nothing except log a warning. The cursor is the source of truth. Use `pnpm reindex` when you mean it.
+Changing `START_BLOCK_<CHAIN>` after a chain has a cursor does not touch its rows. The value is recorded as where a full `pnpm reindex` begins; nothing is re-read until you run that.
+
+Every log from a registry is checked against the registry's ABI. An event the ABI declares but the indexer does not store (`Approval`, `Upgraded`, ...) is skipped. A stored event that fails to decode stops the chain with the error on the dashboard, because that is what a registry upgrade that changes an event looks like, and silently moving past it would lose data. An event topic the ABI does not know is skipped and reported once in the log and as `unknownEvents` in the indexer's health.
 
 ### Enrich
 
-`packages/enrich-erc8004/src/index.ts` and `fetchUri.ts`. A pass runs about once a minute and selects agents whose URI has no row, whose URI changed, or whose error retry is due. Each chain gets its own share: up to 200 `data:` URIs (decoded locally) and up to 40 network fetches, 500 agents per pass in total. Agents that share one URI are fetched once. `ipfs://` and the public gateway hosts (`ipfs.io`, `dweb.link`, `cloudflare-ipfs.com`, `nftstorage.link`, `w3s.link`, `4everland.io`, `gateway.pinata.cloud`) are fetched through `IPFS_GATEWAY`. Between passes the worker polls `ops.jobs` for `refetch_registration` jobs, which the Explorer page creates.
+`packages/enrich-erc8004/src/index.ts` and `fetchUri.ts`. A pass runs about once a minute. It looks at agents the indexer wrote since the last pass (`erc8004.agents.updated_at`) and at files whose retry is due, so a pass costs a few index lookups rather than a scan of every agent. After a restart, or while a backlog is larger than one pass can take, it looks at every agent instead; that scan is about two seconds on 600,000 agents. Each chain gets its own share: up to 200 `data:` URIs (decoded locally) and up to 40 network fetches, 500 agents per pass in total. Agents that share one URI are fetched once. `ipfs://` and the public gateway hosts (`ipfs.io`, `dweb.link`, `cloudflare-ipfs.com`, `nftstorage.link`, `w3s.link`, `4everland.io`, `gateway.pinata.cloud`) are fetched through `IPFS_GATEWAY`. Between passes the worker polls `ops.jobs` for `refetch_registration` jobs, which the Explorer page creates.
 
-Private, loopback, and link-local addresses are refused, including decimal forms such as `http://2130706433/`. Only ports 80 and 443 are fetched. Redirects are checked again. A file that contains a NUL byte is stripped before insert. If one row still cannot be stored, that agent is marked and the pass continues.
+Private, loopback, link-local, and IPv4-in-IPv6 addresses are refused, including decimal forms such as `http://2130706433/`. Only ports 80 and 443 are fetched. Redirects are checked again. An IPFS path is resolved against the gateway and must stay under it. One URI gets three times `FETCH_TIMEOUT_MS` in total, redirects included, on top of the idle timeout, so a server that drips bytes cannot hold a worker. A file that contains a NUL byte is stripped before insert. If Postgres rejects the content itself, that agent is marked `unstorable content` and the pass continues; any other database error fails the pass and the agent stays due. The file row and its service rows are written in one transaction.
 
-`fetch_status` is `ok` or `error`. No row yet means not attempted. `unsupported uri scheme`, `invalid json`, `blocked address`, `unstorable content`, `HTTP 404`, and `HTTP 410` are not retried. Other errors wait 1 hour, then 6 hours, 1 day, then 7 days.
+`fetch_status` is `ok` or `error`. No row yet means not attempted. `unsupported uri scheme`, `invalid json`, `blocked address`, `unstorable content`, `HTTP 404`, and `HTTP 410` are final for the URI they were recorded against; a new on-chain URI is tried again. Other errors wait 1 hour, then 6 hours, 1 day, then 7 days.
 
 ### Importer (optional)
 
@@ -212,7 +216,7 @@ Set `START_BLOCK_<CHAIN>` only to skip history. A block after the deploy block p
 | `pnpm migrate:ponder` | One-time move of a Ponder-era database |
 | `pnpm cleanup:ponder` | Drop what Ponder left behind, after you type `yes` |
 
-`pnpm sanity` compares a sample of agents and non-revoked feedback with the chain at the indexed block, with the subgraph when one is configured, and with 8004scan. Chain mismatches fail. Subgraph and 8004scan count gaps warn. A transport error against Alchemy is a failed chain check even when the row is fine, so one blip fails the run.
+`pnpm sanity` compares a sample of agents and non-revoked feedback with the chain at the indexed block, with the subgraph when one is configured, and with 8004scan. A chain mismatch fails. An agent the subgraph does not have yet, a feedback count that differs from the subgraph, or 8004scan listing more agents than this indexer warns. On an RPC without archive state the chain reads fall back to the head and warn instead of failing. A transport error against the RPC is still a failed chain check even when the row is fine, so one blip fails the run.
 
 ## Repository layout
 
@@ -240,7 +244,7 @@ One small Linux VPS runs everything: 2 shared vCPUs, 8 GB RAM, and 40 GB disk ar
 - **Service.** A system user owns the checkout and runs `pnpm start` under systemd with `Restart=on-failure`. `pnpm start` does not rebuild the dashboard; run `pnpm ops:build` after each update.
 - **Fresh start.** Leave `START_BLOCK_<CHAIN>` empty and every chain is read from the registry's deploy block. Five chains take one to two hours and under $2 of Alchemy compute units. Registration files take about a day.
 - **Dashboard.** It listens on `127.0.0.1` only. Reach it with `ssh -L 42070:127.0.0.1:42070 <server>`.
-- **App access.** Open Postgres for `app_ro` only, over TLS: `listen_addresses = '*'` plus `hostssl <db> app_ro 0.0.0.0/0 scram-sha-256` in `pg_hba.conf`, and the provider's firewall for port 5432. The app connects with `sslmode=require`. `app_ro` is capped at 30 connections and 10-second queries.
+- **App access.** Open Postgres for `app_ro` only, over TLS: `listen_addresses = '*'` plus `hostssl <db> app_ro 0.0.0.0/0 scram-sha-256` in `pg_hba.conf`, and the provider's firewall for port 5432. The app connects with `sslmode=require`. `app_ro` is capped at 30 connections and 10-second queries, and cannot create tables, temporary ones included. `pnpm db:init` stores its password as a SCRAM verifier, so the password never reaches the Postgres log.
 - **Backups.** Dump the whole database nightly. The chain tables can be rebuilt from the RPC cheaply; `enrich` takes a day to refetch.
 - **Updates.** `git pull`, `pnpm install --frozen-lockfile`, `pnpm db:init`, `pnpm ops:build`, then restart the service. Every chain resumes from its cursor.
 
@@ -260,16 +264,15 @@ That is about 3.4M units, roughly $1.50 a month. Measured on 15 Oct 2026: re-rea
 
 These are real. A new agent should not "fix" them by dropping schemas.
 
-- **Reorgs deeper than the confirmation window are not undone.** The indexer stays 12 to 240 blocks behind the head and never rewrites applied ranges. A deeper reorg would leave a stale row until `pnpm reindex --from` replays it. Sanity's chain comparison would show it as a mismatch.
+- **Reorgs deeper than the confirmation window are not undone.** The indexer stays 30 to 240 blocks behind the head and never rewrites applied ranges. A deeper reorg would leave a stale row until `pnpm reindex --from` replays it. Sanity's chain comparison would show it as a mismatch.
 - **Strings from the chain lose NUL characters.** Postgres text cannot store them. An agent URI that contains one differs from `tokenURI` by that character, and sanity reports it.
 - **`erc8004.events` keeps 7 days.** It is for the dashboard. The tables are rebuilt from the RPC, not from it.
 - **Explorer dropdown is Base only** (`packages/ops/ui/src/pages/ExplorerPage.tsx`). The API accepts other chain ids.
 - **Overview progress is the last snapshot.** A stopped supervisor still shows the last numbers until a new process writes a snapshot.
 - **The indexer has no pause button.** Use `POST /api/workers/indexer/pause` or Stop on Overview.
 - **Mirror incremental sync can skip rows** that share a timestamp at a 1,000-row page boundary, and it does not re-read a feedback row when it is later revoked (`createdAt` does not change). Fine for a coarse count check. Not fine as a source of truth. It only matters when the importer is enabled.
-- **A terminal enrich error is sticky across a URI change.** If the old URI was `HTTP 404` or `invalid json`, a newer on-chain URI is not fetched until that rule is narrowed.
 - **Pinata's public gateway returns HTTP 429** under load. IPFS files retry on the long ladder (1h, 6h, 1d, 7d). A keyed gateway in `IPFS_GATEWAY` is the durable fix.
-- **Service rows for one agent are written as several autocommits.** A crash between the delete and the inserts can leave `fetch_status = ok` and an empty service list.
+- **Finding leftover children needs `lsof`.** After a hard kill of the supervisor, its children keep running. The next start finds them by their health ports with `lsof` and stops them. Without `lsof` (Ubuntu minimal does not ship it) the supervisor logs that once, a leftover keeps its port, and the new child exits until the leftover is killed by hand. A second supervisor started by hand while one runs stops at once with "port 42070 is taken" and touches nothing.
 - **`ops.logs` is not what the Logs page shows.** The page is the in-memory ring since this process started. The table is kept for 3 days and is not read back after a restart.
 - **There is no automated test suite.** `pnpm typecheck` is the check that runs in this repo.
 

@@ -1,6 +1,6 @@
 import { confirmationsFor, envInt, getPool, log, type EnabledChain, type RegistryKind } from "@merces/shared";
 import { applyEvents, decodeLogs } from "./apply.js";
-import { blockNumber, getLogs, type ChainCounters } from "./rpc.js";
+import { blockNumber, fillBlockTimestamps, getLogs, type ChainCounters } from "./rpc.js";
 
 /** At most this many eth_getLogs chunks per cycle. A chain further behind continues on the next cycle at once. */
 const MAX_CHUNKS_PER_CYCLE = 250;
@@ -21,6 +21,8 @@ export type ChainState = {
   catchingUp: boolean;
   events: number;
   counters: ChainCounters;
+  warnedNoTimestamp: boolean;
+  unknownEvents: number;
 };
 
 export function intervalFor(key: string): number {
@@ -48,6 +50,8 @@ export function newState(chain: EnabledChain): ChainState {
     catchingUp: true,
     events: 0,
     counters: { requests: 0, errors: 0 },
+    warnedNoTimestamp: false,
+    unknownEvents: 0,
   };
 }
 
@@ -69,13 +73,32 @@ export async function ensureCursor(state: ChainState): Promise<void> {
   );
   const stored = row.rows[0];
   if (stored && Number(stored.start_block) !== state.startBlock) {
-    log("warn", "START_BLOCK differs from the stored cursor; nothing was re-indexed", {
+    // The stored value only matters to `pnpm reindex`, which reads it as "where a full re-read begins".
+    // Keep it equal to the configuration; the applied rows are not touched.
+    await pool.query("UPDATE erc8004.cursors SET start_block = $2, updated_at = now() WHERE chain = $1", [state.key, state.startBlock]);
+    log("info", "start block changed; existing rows kept, a full reindex now begins there", {
       chain: state.key,
-      env: state.startBlock,
-      stored: Number(stored.start_block),
+      was: Number(stored.start_block),
+      now: state.startBlock,
     });
   }
   state.lastBlock = stored ? Number(stored.last_block) : null;
+}
+
+const reportedUnknown = new Set<string>();
+
+function reportUnknown(state: ChainState, unknown: string[], from: number, to: number): void {
+  for (const topic of unknown) {
+    state.unknownEvents += 1;
+    const key = `${state.key}:${topic}`;
+    if (reportedUnknown.has(key)) continue;
+    reportedUnknown.add(key);
+    log("warn", "a registry emitted an event this indexer does not know; it was skipped", {
+      chain: state.key,
+      topic,
+      blocks: `${from}-${to}`,
+    });
+  }
 }
 
 /** Thrown when the cursor changed under a running cycle, for example by `pnpm reindex`. */
@@ -116,7 +139,13 @@ export async function runCycle(state: ChainState, addresses: Record<RegistryKind
       const [from, to] = ranges[index] as [number, number];
       const logs = await (pending[index] as Promise<Awaited<ReturnType<typeof getLogs>>>);
       request(index + PREFETCH);
-      const { events } = decodeLogs(logs, addresses);
+      const filled = await fillBlockTimestamps(state.url, logs, state.counters);
+      if (filled > 0 && !state.warnedNoTimestamp) {
+        state.warnedNoTimestamp = true;
+        log("warn", "this RPC omits blockTimestamp in eth_getLogs; fetching one block header per block with events", { chain: state.key });
+      }
+      const { events, unknown } = decodeLogs(logs, addresses);
+      if (unknown.length > 0) reportUnknown(state, unknown, from, to);
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -124,7 +153,9 @@ export async function runCycle(state: ChainState, addresses: Record<RegistryKind
           "SELECT last_block::text FROM erc8004.cursors WHERE chain = $1 FOR UPDATE",
           [state.key],
         );
-        if (Number(locked.rows[0]?.last_block) !== from - 1) throw new CursorMoved(`cursor for ${state.key} moved`);
+        const lockedLast = locked.rows[0]?.last_block;
+        if (lockedLast == null) throw new Error(`cursor row for ${state.key} is missing; run pnpm db:init and restart`);
+        if (Number(lockedLast) !== from - 1) throw new CursorMoved(`cursor for ${state.key} moved`);
         await applyEvents(client, state.chainId, events);
         await client.query(
           `UPDATE erc8004.cursors
@@ -147,6 +178,7 @@ export async function runCycle(state: ChainState, addresses: Record<RegistryKind
     if (error instanceof CursorMoved) {
       log("info", "cursor moved during the cycle; starting over next cycle", { chain: state.key });
       state.catchingUp = true;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       return;
     }
     throw error;

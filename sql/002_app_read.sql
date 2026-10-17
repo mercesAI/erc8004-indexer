@@ -28,7 +28,15 @@ CREATE INDEX IF NOT EXISTS enrich_registration_name_lower
 CREATE INDEX IF NOT EXISTS enrich_services_name
   ON enrich.agent_services (name);
 
--- app_ro may be reachable from the internet. Cap what one client can hold or run.
+-- app_ro may be reachable from the internet. Cap what one client can hold or run, and take away the
+-- PUBLIC defaults that would let it create tables (temporary or in schema public) and fill the disk.
+-- TEMP comes from PUBLIC, so it has to be taken from PUBLIC; the owner role keeps it regardless.
+DO $$
+BEGIN
+  EXECUTE format('REVOKE TEMP ON DATABASE %I FROM PUBLIC', current_database());
+END
+$$;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ALTER ROLE app_ro CONNECTION LIMIT 30;
 ALTER ROLE app_ro SET statement_timeout = '10s';
 ALTER ROLE app_ro SET idle_in_transaction_session_timeout = '30s';

@@ -85,12 +85,18 @@ function startHealth(states: ChainState[]): void {
               events: state.events,
               rpcRequests: state.counters.requests,
               rpcErrors: state.counters.errors,
+              unknownEvents: state.unknownEvents,
             },
           ]),
         ),
       }),
     );
-  }).listen(port, "127.0.0.1");
+  })
+    .on("error", (error: NodeJS.ErrnoException) => {
+      log("error", "health server failed", { port, error: error.message });
+      process.exit(1);
+    })
+    .listen(port, "127.0.0.1");
 }
 
 async function main(): Promise<void> {

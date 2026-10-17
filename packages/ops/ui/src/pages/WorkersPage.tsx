@@ -14,7 +14,7 @@ type Workers = {
   health: {
     indexer?: { paused?: boolean; chains?: Record<string, IndexerChain> };
     importer?: { lastPass?: Record<string, unknown> };
-    enrich?: { queueDepth?: number };
+    enrich?: { queueDepth?: number; watermark?: string };
   } | null;
   chains: string[];
   importerEnabled: boolean;
@@ -188,7 +188,7 @@ export function WorkersPage() {
           </button>
         </div>
         <p className="text-sm">
-          Queue {enrichHealth?.queueDepth ?? "—"} · pending retry {data?.enrich.pendingRetry ?? 0}
+          Due now {enrichHealth?.queueDepth ?? "—"} · waiting for a retry {data?.enrich.pendingRetry ?? 0}
           {data?.enrich.byStatus.map((row) => ` · ${row.status} ${row.n}`).join("")}
         </p>
         <div className="mt-3 h-48">

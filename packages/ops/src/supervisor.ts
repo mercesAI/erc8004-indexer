@@ -26,15 +26,26 @@ if (!state.tables) {
   process.exit(1);
 }
 
-const { rebuilt } = await ensureReadModel();
-if (rebuilt) recordLine("ops", "info", "rebuilt the read views");
+try {
+  const { rebuilt } = await ensureReadModel();
+  if (rebuilt) recordLine("ops", "info", "rebuilt the read views");
+} catch (error) {
+  // Usually a lock timeout while the app holds a view open. The metrics tick retries.
+  recordLine("ops", "error", `read views not rebuilt yet: ${error instanceof Error ? error.message : String(error)}`);
+}
 
 const manager = new ProcessManager();
+// Bind the dashboard first: if another supervisor holds the port, stop here instead of taking over its children.
+try {
+  await startServer(manager);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
 await reclaimIndexerPorts(PROC_NAMES.map(healthPort));
 startLogWriter();
 startMetrics();
 startSanitySchedule();
-startServer(manager);
 manager.startAll();
 
 let shuttingDown = false;

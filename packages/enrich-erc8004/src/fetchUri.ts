@@ -59,6 +59,12 @@ blockedNets.addAddress("::", "ipv6");
 blockedNets.addAddress("::1", "ipv6");
 blockedNets.addSubnet("fc00::", 7, "ipv6");
 blockedNets.addSubnet("fe80::", 10, "ipv6");
+// Transition forms that embed an IPv4 address: NAT64, 6to4, and IPv4-compatible.
+blockedNets.addSubnet("64:ff9b::", 96, "ipv6");
+blockedNets.addSubnet("2002::", 16, "ipv6");
+blockedNets.addSubnet("::", 96, "ipv6");
+
+export { onGateway as gatewayUrlForTest };
 
 export function sanitizeStoredText(value: string): string {
   return value
@@ -187,7 +193,14 @@ export function parseRegistration(value: unknown): ParsedRegistration {
   };
 }
 
-async function httpGet(raw: string, hops = 0): Promise<{ body: string; httpStatus: number }> {
+/** Total time one URI may take, redirects included. The per-socket idle timeout alone lets a slow drip run for days. */
+function fetchDeadline(): number {
+  return Date.now() + 3 * envInt("FETCH_TIMEOUT_MS", 8000);
+}
+
+async function httpGet(raw: string, deadline: number, hops = 0): Promise<{ body: string; httpStatus: number }> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("timeout");
   const url = publicUrl(raw);
   const addresses = await publicAddresses(url.hostname);
   const first = addresses.find((item) => item.family === 4) ?? addresses[0];
@@ -247,13 +260,18 @@ async function httpGet(raw: string, hops = 0): Promise<{ body: string; httpStatu
       req.destroy();
       reject(new Error("timeout"));
     });
+    const killer = setTimeout(() => {
+      req.destroy();
+      reject(new Error("timeout"));
+    }, remaining);
+    req.on("close", () => clearTimeout(killer));
     req.on("error", () => reject(new Error("fetch failed")));
     req.end();
   });
   if (result.status >= 300 && result.status < 400) {
     if (hops >= 3) throw new Error("too many redirects");
     if (!result.location) throw new Error("fetch failed");
-    return httpGet(new URL(result.location, url).href, hops + 1);
+    return httpGet(new URL(result.location, url).href, deadline, hops + 1);
   }
   if (result.status < 200 || result.status >= 300) {
     const error = new Error(`HTTP ${result.status}`) as Error & { httpStatus: number };
@@ -268,16 +286,34 @@ function gatewayBase(): string {
   return gateway.endsWith("/") ? gateway : `${gateway}/`;
 }
 
+/**
+ * The gateway URL for an IPFS path. The path is resolved against the gateway the way a browser would,
+ * then required to still sit under the gateway's own path, so `..`, `%2e%2e`, or an absolute path
+ * cannot steer the request elsewhere on the gateway host.
+ */
+function onGateway(path: string): string {
+  const base = new URL(gatewayBase());
+  let target: URL;
+  try {
+    target = new URL(path, base);
+  } catch {
+    throw new Error("unsupported uri scheme");
+  }
+  if (target.origin !== base.origin || !target.pathname.startsWith(base.pathname) || target.pathname.length <= base.pathname.length) {
+    throw new Error("unsupported uri scheme");
+  }
+  return target.href;
+}
+
 function gatewayFor(uri: string): string | null {
   if (uri.startsWith("ipfs://")) {
     const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
-    if (!path || path.split("/").some((part) => part === ".." || part === ".")) throw new Error("unsupported uri scheme");
-    return `${gatewayBase()}${path}`;
+    if (!path) throw new Error("unsupported uri scheme");
+    return onGateway(path);
   }
   const match = uri.match(PUBLIC_IPFS_GATEWAY);
   if (!match?.[1]) return null;
-  if (match[1].split("/").some((part) => part === ".." || part === ".")) throw new Error("unsupported uri scheme");
-  return `${gatewayBase()}${match[1]}`;
+  return onGateway(match[1]);
 }
 
 export async function resolveUri(uri: string): Promise<FetchResult> {
@@ -286,11 +322,11 @@ export async function resolveUri(uri: string): Promise<FetchResult> {
     let httpStatus: number | null = null;
     const rewritten = gatewayFor(uri);
     if (rewritten) {
-      const fetched = await httpGet(rewritten);
+      const fetched = await httpGet(rewritten, fetchDeadline());
       body = fetched.body;
       httpStatus = fetched.httpStatus;
     } else if (uri.startsWith("https://") || uri.startsWith("http://")) {
-      const fetched = await httpGet(uri);
+      const fetched = await httpGet(uri, fetchDeadline());
       body = fetched.body;
       httpStatus = fetched.httpStatus;
     } else if (uri.startsWith("data:application/json") && uri.includes(";base64,")) {

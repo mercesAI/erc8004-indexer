@@ -69,7 +69,7 @@ export async function runSanity(): Promise<SanityReport> {
   running = true;
   try {
     const rows: SanityRow[] = [];
-    const sample = Number(process.env.SANITY_SAMPLE ?? "10");
+    const sample = Math.max(1, envInt("SANITY_SAMPLE", 10));
     for (const chain of enabledChains()) {
       rows.push(await lagRow(chain));
       const agents = await sampleAgents(chain.chainId, sample);
@@ -166,6 +166,21 @@ async function sampleFeedback(chainId: number, limit: number): Promise<FeedbackS
   return result.rows;
 }
 
+const NO_ARCHIVE = /missing trie node|state (is )?not available|historical state|archive|pruned|block not found|header not found/i;
+
+/**
+ * Read a contract at the indexed block. A provider without archive state cannot serve old blocks;
+ * then read at the head instead and say so, which is a warning rather than a failure.
+ */
+async function readAt<T>(reader: (blockNumber: bigint | undefined) => Promise<T>, blockNumber: bigint): Promise<{ value: T; atHead: boolean }> {
+  try {
+    return { value: await reader(blockNumber), atHead: false };
+  } catch (error) {
+    if (!NO_ARCHIVE.test(error instanceof Error ? error.message : String(error))) throw error;
+    return { value: await reader(undefined), atHead: true };
+  }
+}
+
 async function agentChainRow(chain: EnabledChain, agent: AgentSample, blockNumber: bigint | null): Promise<SanityRow> {
   const subject = `${chain.chainId}:${agent.agent_id}`;
   if (blockNumber == null) return row("agent_chain", chain.key, subject, "warn", {}, "no indexed block");
@@ -173,11 +188,15 @@ async function agentChainRow(chain: EnabledChain, agent: AgentSample, blockNumbe
     const client = getPublicClient(chain.key);
     const address = registryAddress("identity");
     const args = [BigInt(agent.agent_id)] as const;
-    const [owner, uri, wallet] = await Promise.all([
-      client.readContract({ address, abi: IdentityRegistryAbi, functionName: "ownerOf", args, blockNumber }),
-      client.readContract({ address, abi: IdentityRegistryAbi, functionName: "tokenURI", args, blockNumber }),
-      client.readContract({ address, abi: IdentityRegistryAbi, functionName: "getAgentWallet", args, blockNumber }),
-    ]);
+    const { value: [owner, uri, wallet], atHead } = await readAt(
+      (at) =>
+        Promise.all([
+          client.readContract({ address, abi: IdentityRegistryAbi, functionName: "ownerOf", args, blockNumber: at }),
+          client.readContract({ address, abi: IdentityRegistryAbi, functionName: "tokenURI", args, blockNumber: at }),
+          client.readContract({ address, abi: IdentityRegistryAbi, functionName: "getAgentWallet", args, blockNumber: at }),
+        ]),
+      blockNumber,
+    );
     const fields = {
       owner: { left: agent.owner, right: String(owner).toLowerCase() },
       agentUri: { left: agent.agent_uri, right: String(uri) },
@@ -187,6 +206,7 @@ async function agentChainRow(chain: EnabledChain, agent: AgentSample, blockNumbe
       fields.owner.left === fields.owner.right &&
       fields.agentUri.left === fields.agentUri.right &&
       sameAddress(fields.agentWallet.left, fields.agentWallet.right);
+    if (atHead) return row("agent_chain", chain.key, subject, ok ? "pass" : "warn", fields, `${ok ? "matches" : "differs from"} the chain head; the RPC has no archive state for the indexed block`);
     return row("agent_chain", chain.key, subject, ok ? "pass" : "fail", fields, ok ? "matches chain" : "mismatch");
   } catch (error) {
     return row("agent_chain", chain.key, subject, "fail", {}, error instanceof Error ? error.message : String(error));
@@ -197,13 +217,17 @@ async function feedbackChainRow(chain: EnabledChain, item: FeedbackSample, block
   const subject = `${chain.chainId}:${item.agent_id}:${item.client_address}:${item.feedback_index}`;
   if (blockNumber == null) return row("feedback_chain", chain.key, subject, "warn", {}, "no indexed block");
   try {
-    const result = await getPublicClient(chain.key).readContract({
-      address: registryAddress("reputation"),
-      abi: ReputationRegistryAbi,
-      functionName: "readFeedback",
-      args: [BigInt(item.agent_id), getAddress(item.client_address), BigInt(item.feedback_index)],
+    const { value: result, atHead } = await readAt(
+      (at) =>
+        getPublicClient(chain.key).readContract({
+          address: registryAddress("reputation"),
+          abi: ReputationRegistryAbi,
+          functionName: "readFeedback",
+          args: [BigInt(item.agent_id), getAddress(item.client_address), BigInt(item.feedback_index)],
+          blockNumber: at,
+        }),
       blockNumber,
-    });
+    );
     const parsed = parseFeedback(result);
     const fields = {
       value: { left: item.value, right: parsed.value.toString() },
@@ -213,6 +237,7 @@ async function feedbackChainRow(chain: EnabledChain, item: FeedbackSample, block
       isRevoked: { left: String(item.is_revoked), right: String(parsed.isRevoked) },
     };
     const ok = Object.values(fields).every((field) => field.left === field.right);
+    if (atHead) return row("feedback_chain", chain.key, subject, ok ? "pass" : "warn", fields, `${ok ? "matches" : "differs from"} the chain head; the RPC has no archive state for the indexed block`);
     return row("feedback_chain", chain.key, subject, ok ? "pass" : "fail", fields, ok ? "matches chain" : "mismatch");
   } catch (error) {
     return row("feedback_chain", chain.key, subject, "fail", {}, error instanceof Error ? error.message : String(error));
@@ -251,7 +276,7 @@ async function agentSubgraphRow(chain: EnabledChain, agent: AgentSample): Promis
     const data = await subgraphQuery<{
       agent: { owner: string; agentURI: string | null; totalFeedback: string } | null;
     }>(chain.key, `query ($id: ID!) { agent(id: $id) { owner agentURI totalFeedback } }`, { id: subject });
-    if (!data.agent) return row("agent_subgraph", chain.key, subject, "fail", {}, "missing from subgraph");
+    if (!data.agent) return row("agent_subgraph", chain.key, subject, "warn", {}, "not in the subgraph yet; it lags the chain by minutes");
     const fields = {
       owner: { left: agent.owner, right: data.agent.owner.toLowerCase() },
       agentUri: { left: agent.agent_uri, right: data.agent.agentURI ?? "" },
@@ -259,9 +284,10 @@ async function agentSubgraphRow(chain: EnabledChain, agent: AgentSample): Promis
     };
     const identityOk = fields.owner.left === fields.owner.right && fields.agentUri.left === fields.agentUri.right;
     const countOk = fields.feedbackCount.left === fields.feedbackCount.right;
-    const preChunk = agent.registered_block == null || BigInt(agent.registered_block) < BigInt(chain.startBlock);
-    const status: SanityStatus = !identityOk ? "fail" : !countOk && preChunk ? "warn" : !countOk ? "fail" : "pass";
-    return row("agent_subgraph", chain.key, subject, status, fields, preChunk && !countOk ? "count differs; agent predates the chunk" : status);
+    // Owner and URI are facts of the chain. Feedback counts depend on what each side counts (revoked
+    // feedback, the subgraph's own start block), so a difference is a warning, not a failure.
+    const status: SanityStatus = !identityOk ? "fail" : !countOk ? "warn" : "pass";
+    return row("agent_subgraph", chain.key, subject, status, fields, !identityOk ? "mismatch" : !countOk ? "feedback count differs" : "matches subgraph");
   } catch (error) {
     return row("agent_subgraph", chain.key, subject, "warn", {}, error instanceof Error ? error.message : String(error));
   }
@@ -303,17 +329,21 @@ async function countsRow(chain: EnabledChain): Promise<SanityRow> {
       scan = error instanceof Error ? error.message : "error";
     }
     const postgres = pg.rows[0]?.n ?? "0";
-    const same = scan === "n/a" || scan === postgres;
+    const scanCount = /^\d+$/.test(scan) ? Number(scan) : null;
+    // 8004scan is a third party with its own lag and filters. Fewer agents there is their business;
+    // more agents there means this indexer may have missed some.
+    const missing = scanCount != null && scanCount > Number(postgres);
     return row(
       "counts",
       chain.key,
       chain.key,
-      same ? "pass" : "warn",
-      {
-        postgres: { left: postgres, right: postgres },
-        scan: { left: postgres, right: scan },
-      },
-      "agents registered since START_BLOCK, compared with 8004scan",
+      missing ? "warn" : "pass",
+      { agents: { left: postgres, right: scan } },
+      scanCount == null
+        ? `${postgres} agents registered since the start block; 8004scan unavailable (${scan})`
+        : missing
+          ? `8004scan lists ${scanCount - Number(postgres)} more agents than this indexer`
+          : `${postgres} agents registered since the start block; 8004scan lists ${scan}`,
     );
   } catch (error) {
     return row("counts", chain.key, chain.key, "warn", {}, error instanceof Error ? error.message : String(error));

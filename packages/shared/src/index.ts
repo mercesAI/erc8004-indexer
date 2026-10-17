@@ -2,7 +2,7 @@ export { ZERO_ADDRESS, CHAINS, chainDisplayName, confirmationsFor, enabledChains
 export type { ChainKey, ChainSpec, EnabledChain, RegistryKind } from "./chains.js";
 export { getPool, closePool } from "./db.js";
 export { envInt, envList, envString, findRepoRoot, loadEnv, reloadEnv } from "./env.js";
-export { redactSecrets } from "./redact.js";
+export { redactSecrets, resetRedaction } from "./redact.js";
 export { log } from "./logger.js";
 export type { LogLevel } from "./logger.js";
 export { alchemyMaxRps, getPublicClient, rpcUrlFor } from "./rpc.js";

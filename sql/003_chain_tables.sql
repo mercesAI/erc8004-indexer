@@ -22,7 +22,12 @@ CREATE TABLE IF NOT EXISTS erc8004.agents (
   PRIMARY KEY (chain_id, agent_id)
 );
 
+-- When this row was last written by the indexer (database time, not chain time). The enrich worker
+-- uses it to find agents whose URI may have changed without scanning the whole table.
+ALTER TABLE erc8004.agents ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
 CREATE INDEX IF NOT EXISTS agents_owner ON erc8004.agents (owner);
+CREATE INDEX IF NOT EXISTS agents_updated_at ON erc8004.agents (updated_at);
 -- Serves the app's newest-first list: read.agents orders by read.unix_seconds(registered_at), which the planner
 -- inlines to exactly this expression.
 DROP INDEX IF EXISTS erc8004.agents_chain_registered;
@@ -125,3 +130,7 @@ CREATE TABLE IF NOT EXISTS erc8004.cursors (
 INSERT INTO ops.worker_control (worker)
 VALUES ('indexer')
 ON CONFLICT (worker) DO NOTHING;
+
+-- Adding updated_at stamps every existing row at once, which autovacuum does not count as a change.
+-- Fresh statistics let the enrich worker's selection use the new index right away.
+ANALYZE erc8004.agents;

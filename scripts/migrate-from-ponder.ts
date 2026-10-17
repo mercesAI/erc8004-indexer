@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { closePool, findRepoRoot, getPool, loadEnv } from "../packages/shared/src/index.ts";
+import { closePool, envInt, findRepoRoot, getPool, isChainKey, getChain, loadEnv } from "../packages/shared/src/index.ts";
 import { ensureReadModel } from "../packages/ops/src/schemas.ts";
 
 /**
@@ -77,6 +77,13 @@ const startBlocks = new Map(
 console.log("Chains to migrate:");
 for (const chain of chains) console.log(`  ${chain.chain} (${chain.chainId}) from ${chain.schema}, resume after block ${chain.lastBlock}`);
 
+/** Where a later full `pnpm reindex` begins: the configured START_BLOCK, or the registry's deploy block. */
+function startBlockFor(chain: string): number {
+  if (!isChainKey(chain)) throw new Error(`Unknown chain ${chain}; add it to packages/shared/src/chains.ts first`);
+  const spec = getChain(chain);
+  return envInt(spec.startBlockEnvVar, spec.identityDeployBlock);
+}
+
 const root = findRepoRoot();
 const ddl = readFileSync(join(root, "sql/003_chain_tables.sql"), "utf8");
 const client = await pool.connect();
@@ -112,7 +119,7 @@ try {
              ON CONFLICT DO NOTHING`);
     await client.query(
       `INSERT INTO erc8004.cursors (chain, chain_id, start_block, last_block) VALUES ($1, $2, $3, $4)`,
-      [chain, chainId, startBlocks.get(chain) ?? lastBlock, lastBlock],
+      [chain, chainId, startBlocks.get(chain) ?? startBlockFor(chain), lastBlock],
     );
   }
   // feedback_count and last_feedback_at count non-revoked feedback only (Ponder counted revoked rows too).

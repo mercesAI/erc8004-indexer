@@ -205,11 +205,20 @@ function signatureOf(statements: string[]): string {
 
 const VIEW_LOCK = 842004;
 
-/** Rebuild the `read` views if their SQL changed or they are missing. Safe to call often. */
-export async function ensureReadModel(): Promise<{ rebuilt: boolean }> {
+/**
+ * Rebuild the `read` views if their SQL changed or they are missing. Safe to call often.
+ * With `wait: false` a caller that finds another rebuild in progress returns at once instead of
+ * queueing a pool connection behind it; the periodic metrics tick uses that.
+ */
+export async function ensureReadModel(options: { wait?: boolean } = {}): Promise<{ rebuilt: boolean; busy?: boolean }> {
   const client = await getPool().connect();
   try {
-    await client.query("SELECT pg_advisory_lock($1)", [VIEW_LOCK]);
+    if (options.wait === false) {
+      const got = await client.query<{ ok: boolean }>("SELECT pg_try_advisory_lock($1) AS ok", [VIEW_LOCK]);
+      if (!got.rows[0]?.ok) return { rebuilt: false, busy: true };
+    } else {
+      await client.query("SELECT pg_advisory_lock($1)", [VIEW_LOCK]);
+    }
     await client.query(`CREATE TABLE IF NOT EXISTS ops.view_signature (id integer PRIMARY KEY, signature text NOT NULL)`);
     const statements = readModelStatements();
     const signature = signatureOf(statements);

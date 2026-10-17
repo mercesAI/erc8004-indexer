@@ -102,7 +102,7 @@ All of these are views. `SELECT` only. They update as the collectors run. A quer
 
 A later failed fetch does not wipe an earlier success. If `fetch_status` is `error` and `name` is still set, the name is from the previous good file. Prefer fields from a row whose `fetch_status` is `ok`. There is no `read.registration_files` row until the first attempt, so a missing row means "not tried yet", which is different from `fetch_status` null on the agent only when the join has not matched. On `read.agents`, null `fetch_status` means no attempt row.
 
-Six `fetch_error` values are terminal and are never retried: `unsupported uri scheme`, `invalid json`, `blocked address`, `unstorable content`, `HTTP 404`, `HTTP 410`. Every other error retries after 1 hour, then 6 hours, 1 day, and then every 7 days. A terminal error is sticky across a URI change today: if the agent later gets a new on-chain URI, the fetcher does not try it. Detect that case by comparing `read.agents.agent_uri` with `read.registration_files.agent_uri` for the same key. When they differ, the file row describes the old URI.
+Six `fetch_error` values are final for the URI they were recorded against and are not retried while that URI stays: `unsupported uri scheme`, `invalid json`, `blocked address`, `unstorable content`, `HTTP 404`, `HTTP 410`. Every other error retries after 1 hour, then 6 hours, 1 day, and then every 7 days. When an agent gets a new on-chain URI, the fetcher tries it on the next pass regardless of the old result; until then `read.registration_files.agent_uri` still names the old URI.
 
 ### Other views
 

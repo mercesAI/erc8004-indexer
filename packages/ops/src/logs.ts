@@ -23,6 +23,8 @@ export function recordLine(processName: string, fallbackLevel: string, line: str
   ring.push(row);
   if (ring.length > 5000) ring.shift();
   pending.push(row);
+  // A child that logs faster than the table can take it loses its oldest unflushed lines, not memory.
+  if (pending.length > 5000) pending.splice(0, pending.length - 5000);
 }
 
 function levelOf(line: string, fallback: string): string {
@@ -57,8 +59,22 @@ export function startLogWriter(): void {
   }, 1000);
 }
 
+let flushing = false;
+
 async function flushLogs(): Promise<void> {
-  if (pending.length === 0) return;
+  if (flushing) return;
+  flushing = true;
+  try {
+    for (let batches = 0; batches < 5 && pending.length > 0; batches++) {
+      if (!(await flushBatch())) break;
+    }
+  } finally {
+    flushing = false;
+  }
+}
+
+/** One INSERT of up to 400 rows. False when it failed and the rows went back to the buffer. */
+async function flushBatch(): Promise<boolean> {
   const batch = pending.splice(0, 400);
   const values: string[] = [];
   const params: unknown[] = [];
@@ -72,10 +88,12 @@ async function flushLogs(): Promise<void> {
       `INSERT INTO ops.logs (ts, process, level, line) VALUES ${values.join(",")}`,
       params,
     );
+    return true;
   } catch (error) {
     pending.unshift(...batch);
     if (pending.length > 5000) pending.splice(0, pending.length - 5000);
     console.error(JSON.stringify({ level: "error", msg: "log insert failed", error: String(error) }));
+    return false;
   }
 }
 

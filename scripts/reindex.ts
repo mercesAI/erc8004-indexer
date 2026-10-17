@@ -1,6 +1,6 @@
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { closePool, getChain, getPool, isChainKey, loadEnv } from "../packages/shared/src/index.ts";
+import { closePool, envInt, getChain, getPool, isChainKey, loadEnv } from "../packages/shared/src/index.ts";
 
 /**
  * Re-read a chain from the RPC.
@@ -31,8 +31,15 @@ if (!row) {
   console.error(`No cursor for ${chain}. Add it to CHAINS and start the supervisor; it begins at START_BLOCK on its own.`);
   process.exit(1);
 }
-const chainId = getChain(chain).chainId;
-const replayFrom = fromArg != null ? Number(fromArg) : Number(row.start_block);
+const spec = getChain(chain);
+const chainId = spec.chainId;
+// Full mode begins at the configured start block (empty START_BLOCK_<CHAIN> means the registry's deploy block).
+const configuredStart = envInt(spec.startBlockEnvVar, spec.identityDeployBlock);
+const replayFrom = fromArg != null ? Number(fromArg) : configuredStart;
+if (replayFrom > Number(row.last_block) + 1) {
+  console.error(`--from ${replayFrom} is ahead of the cursor (${row.last_block}); that would skip blocks. Use a block at or below ${Number(row.last_block) + 1}.`);
+  process.exit(1);
+}
 const plan = fromArg != null
   ? `replay ${chain} from block ${replayFrom} (now at ${row.last_block}); rows are kept`
   : `delete every ${chain} row in erc8004 and re-read from block ${replayFrom}`;
@@ -57,10 +64,10 @@ try {
       console.log(`Deleted ${result.rowCount} rows from erc8004.${table}`);
     }
   }
-  await client.query("UPDATE erc8004.cursors SET last_block = $2, last_error = NULL, updated_at = now() WHERE chain = $1", [
-    chain,
-    replayFrom - 1,
-  ]);
+  await client.query(
+    "UPDATE erc8004.cursors SET last_block = $2, start_block = $3, last_error = NULL, updated_at = now() WHERE chain = $1",
+    [chain, replayFrom - 1, configuredStart],
+  );
   await client.query("COMMIT");
 } catch (error) {
   await client.query("ROLLBACK");

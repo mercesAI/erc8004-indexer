@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { envInt, getPool, log } from "@merces/shared";
-import { isTerminalFetchError, resolveUri, RETRY_MS, type ParsedRegistration } from "./fetchUri.js";
+import { isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, type ParsedRegistration } from "./fetchUri.js";
 
 type AgentTarget = {
   chain_id: number;
@@ -21,7 +21,16 @@ const state = {
   paused: false,
   queueDepth: 0,
   lastPass: null as PassStats | null,
+  /**
+   * Agents written by the indexer after this instant are candidates for a fetch. It starts at the
+   * epoch, so the first pass after a restart looks at every agent once, and then only moves forward
+   * when a pass had capacity to spare. A backlog keeps it where it is until the backlog drains.
+   */
+  watermark: new Date(0),
 };
+
+/** How far the watermark trails the scan, so an indexer transaction that committed late is still seen. */
+const WATERMARK_LAG_MS = 2 * 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,8 +44,22 @@ async function isPaused(): Promise<boolean> {
   return state.paused;
 }
 
+/**
+ * Agents that need a fetch, in priority order, limited per chain so one chain cannot starve the
+ * others: up to 200 data: URIs (decoded locally, no network) and up to 40 network fetches each.
+ *
+ * $1 watermark: only agents the indexer wrote after this time are considered, plus every file whose
+ *    retry is due. That keeps a pass to a few index lookups instead of a scan of every agent.
+ * $2 terminal errors: final for the URI they were recorded against. A new on-chain URI is tried again.
+ */
 const DUE_AGENTS = `
-  WITH due AS (
+  WITH candidates AS (
+    SELECT chain_id, agent_id FROM erc8004.agents WHERE updated_at > $1 AND agent_uri <> ''
+    UNION
+    SELECT chain_id, agent_id FROM enrich.registration_files
+    WHERE fetch_status = 'error' AND next_retry_at IS NOT NULL AND next_retry_at <= now()
+  ),
+  due AS (
     SELECT a.chain_id,
            a.agent_id::text AS agent_id,
            a.agent_uri,
@@ -50,27 +73,28 @@ const DUE_AGENTS = `
              WHEN r.agent_id IS NOT NULL AND r.agent_uri IS DISTINCT FROM a.agent_uri THEN 1
              ELSE 2
            END AS priority
-    FROM erc8004.agents a
+    FROM candidates c
+    JOIN erc8004.agents a ON a.chain_id = c.chain_id AND a.agent_id = c.agent_id
     LEFT JOIN enrich.registration_files r
       ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id
     WHERE a.agent_uri <> ''
-      AND COALESCE(r.error, '') NOT IN (
-        'unsupported uri scheme', 'invalid json', 'blocked address', 'unstorable content', 'HTTP 404', 'HTTP 410'
-      )
       AND (
         r.agent_id IS NULL
         OR r.agent_uri IS DISTINCT FROM a.agent_uri
         OR (r.fetch_status = 'error' AND r.next_retry_at IS NOT NULL AND r.next_retry_at <= now())
       )
+      AND NOT (COALESCE(r.error, '') = ANY($2::text[]) AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri)
   ),
   ranked AS (
-    SELECT *, row_number() OVER (
-      PARTITION BY chain_id, (agent_uri LIKE 'data:%')
-      ORDER BY priority, registered_at DESC NULLS LAST
-    ) AS rn
+    SELECT *,
+           row_number() OVER (
+             PARTITION BY chain_id, (agent_uri LIKE 'data:%')
+             ORDER BY priority, registered_at DESC NULLS LAST
+           ) AS rn,
+           count(*) OVER () AS queue_depth
     FROM due
   )
-  SELECT chain_id, agent_id, agent_uri, attempts
+  SELECT chain_id, agent_id, agent_uri, attempts, queue_depth::text AS queue_depth
   FROM ranked
   WHERE (agent_uri LIKE 'data:%' AND rn <= 200)
      OR (agent_uri NOT LIKE 'data:%' AND rn <= 40)
@@ -78,113 +102,111 @@ const DUE_AGENTS = `
   LIMIT 500
 `;
 
-async function queueDepth(): Promise<number> {
-  try {
-    const dueOnly = DUE_AGENTS.slice(0, DUE_AGENTS.indexOf(",\n  ranked AS"));
-    const result = await getPool().query<{ count: string }>(`${dueOnly}\nSELECT count(*)::text AS count FROM due`);
-    state.queueDepth = Number(result.rows[0]?.count ?? 0);
-  } catch {
-    state.queueDepth = 0;
-  }
-  return state.queueDepth;
-}
-
 async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number): Promise<void> {
-  if (result.ok) {
-    const parsed: ParsedRegistration = result.parsed;
-    await getPool().query(
-      `INSERT INTO enrich.registration_files (
-         chain_id, agent_id, agent_uri, content_hash, raw, name, description, image, active,
-         x402_support, supported_trust, fetch_status, http_status, error, fetched_at, next_retry_at, attempts
-       ) VALUES (
-         $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
-         $10, $11, 'ok', $12, NULL, now(), NULL, 0
-       )
-       ON CONFLICT (chain_id, agent_id) DO UPDATE SET
-         agent_uri = EXCLUDED.agent_uri,
-         content_hash = EXCLUDED.content_hash,
-         raw = EXCLUDED.raw,
-         name = EXCLUDED.name,
-         description = EXCLUDED.description,
-         image = EXCLUDED.image,
-         active = EXCLUDED.active,
-         x402_support = EXCLUDED.x402_support,
-         supported_trust = EXCLUDED.supported_trust,
-         fetch_status = 'ok',
-         http_status = EXCLUDED.http_status,
-         error = NULL,
-         fetched_at = now(),
-         next_retry_at = NULL,
-         attempts = 0`,
-      [
-        agent.chain_id,
-        agent.agent_id,
-        agent.agent_uri,
-        result.hash,
-        result.body,
-        parsed.name,
-        parsed.description,
-        parsed.image,
-        parsed.active,
-        parsed.x402Support,
-        parsed.supportedTrust,
-        result.httpStatus,
-      ],
-    );
-    await getPool().query("DELETE FROM enrich.agent_services WHERE chain_id = $1 AND agent_id = $2", [
-      agent.chain_id,
-      agent.agent_id,
-    ]);
-    for (const service of parsed.services) {
-      await getPool().query(
-        `INSERT INTO enrich.agent_services (chain_id, agent_id, name, endpoint, version, extra)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-         ON CONFLICT (chain_id, agent_id, name, endpoint) DO UPDATE SET
-           version = EXCLUDED.version, extra = EXCLUDED.extra`,
-        [agent.chain_id, agent.agent_id, service.name, service.endpoint, service.version, JSON.stringify(service.extra)],
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    if (result.ok) {
+      const parsed: ParsedRegistration = result.parsed;
+      await client.query(
+        `INSERT INTO enrich.registration_files (
+           chain_id, agent_id, agent_uri, content_hash, raw, name, description, image, active,
+           x402_support, supported_trust, fetch_status, http_status, error, fetched_at, next_retry_at, attempts
+         ) VALUES (
+           $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
+           $10, $11, 'ok', $12, NULL, now(), NULL, 0
+         )
+         ON CONFLICT (chain_id, agent_id) DO UPDATE SET
+           agent_uri = EXCLUDED.agent_uri,
+           content_hash = EXCLUDED.content_hash,
+           raw = EXCLUDED.raw,
+           name = EXCLUDED.name,
+           description = EXCLUDED.description,
+           image = EXCLUDED.image,
+           active = EXCLUDED.active,
+           x402_support = EXCLUDED.x402_support,
+           supported_trust = EXCLUDED.supported_trust,
+           fetch_status = 'ok',
+           http_status = EXCLUDED.http_status,
+           error = NULL,
+           fetched_at = now(),
+           next_retry_at = NULL,
+           attempts = 0`,
+        [
+          agent.chain_id,
+          agent.agent_id,
+          agent.agent_uri,
+          result.hash,
+          result.body,
+          parsed.name,
+          parsed.description,
+          parsed.image,
+          parsed.active,
+          parsed.x402Support,
+          parsed.supportedTrust,
+          result.httpStatus,
+        ],
+      );
+      await client.query("DELETE FROM enrich.agent_services WHERE chain_id = $1 AND agent_id = $2", [agent.chain_id, agent.agent_id]);
+      for (const service of parsed.services) {
+        await client.query(
+          `INSERT INTO enrich.agent_services (chain_id, agent_id, name, endpoint, version, extra)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+           ON CONFLICT (chain_id, agent_id, name, endpoint) DO UPDATE SET
+             version = EXCLUDED.version, extra = EXCLUDED.extra`,
+          [agent.chain_id, agent.agent_id, service.name, service.endpoint, service.version, JSON.stringify(service.extra)],
+        );
+      }
+    } else {
+      const terminal = isTerminalFetchError(result.error);
+      const delay = terminal ? null : (RETRY_MS[Math.min(Math.max(attempts, 1) - 1, RETRY_MS.length - 1)] ?? RETRY_MS[3]);
+      // The services of a previous good fetch stay while the URI is unchanged. A new URI that fails drops them.
+      await client.query(
+        `DELETE FROM enrich.agent_services
+         WHERE chain_id = $1 AND agent_id = $2
+           AND EXISTS (
+             SELECT 1 FROM enrich.registration_files existing
+             WHERE existing.chain_id = $1 AND existing.agent_id = $2 AND existing.agent_uri IS DISTINCT FROM $3
+           )`,
+        [agent.chain_id, agent.agent_id, agent.agent_uri],
+      );
+      await client.query(
+        `INSERT INTO enrich.registration_files (
+           chain_id, agent_id, agent_uri, fetch_status, http_status, error, fetched_at, next_retry_at, attempts
+         ) VALUES (
+           $1, $2, $3, 'error', $4, $5, now(),
+           CASE WHEN $6::text IS NULL THEN NULL ELSE now() + ($6::text || ' milliseconds')::interval END,
+           $7
+         )
+         ON CONFLICT (chain_id, agent_id) DO UPDATE SET
+           agent_uri = EXCLUDED.agent_uri,
+           fetch_status = 'error',
+           http_status = EXCLUDED.http_status,
+           error = EXCLUDED.error,
+           fetched_at = now(),
+           next_retry_at = EXCLUDED.next_retry_at,
+           attempts = EXCLUDED.attempts,
+           raw = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.raw ELSE NULL END,
+           content_hash = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.content_hash ELSE NULL END,
+           name = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.name ELSE NULL END,
+           description = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.description ELSE NULL END,
+           image = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.image ELSE NULL END,
+           active = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.active ELSE NULL END,
+           x402_support = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.x402_support ELSE NULL END,
+           supported_trust = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.supported_trust ELSE NULL END`,
+        [agent.chain_id, agent.agent_id, agent.agent_uri, result.httpStatus, result.error, delay == null ? null : String(delay), attempts],
       );
     }
-    return;
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
   }
-  const terminal = isTerminalFetchError(result.error);
-  const delay = terminal ? null : (RETRY_MS[Math.min(Math.max(attempts, 1) - 1, RETRY_MS.length - 1)] ?? RETRY_MS[3]);
-  await getPool().query(
-    `DELETE FROM enrich.agent_services
-     WHERE chain_id = $1 AND agent_id = $2
-       AND EXISTS (
-         SELECT 1 FROM enrich.registration_files existing
-         WHERE existing.chain_id = $1 AND existing.agent_id = $2 AND existing.agent_uri IS DISTINCT FROM $3
-       )`,
-    [agent.chain_id, agent.agent_id, agent.agent_uri],
-  );
-  await getPool().query(
-    `INSERT INTO enrich.registration_files (
-       chain_id, agent_id, agent_uri, fetch_status, http_status, error, fetched_at, next_retry_at, attempts
-     ) VALUES (
-       $1, $2, $3, 'error', $4, $5, now(),
-       CASE WHEN $6::text IS NULL THEN NULL ELSE now() + ($6::text || ' milliseconds')::interval END,
-       $7
-     )
-     ON CONFLICT (chain_id, agent_id) DO UPDATE SET
-       agent_uri = EXCLUDED.agent_uri,
-       fetch_status = 'error',
-       http_status = EXCLUDED.http_status,
-       error = EXCLUDED.error,
-       fetched_at = now(),
-       next_retry_at = EXCLUDED.next_retry_at,
-       attempts = EXCLUDED.attempts,
-       raw = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.raw ELSE NULL END,
-       content_hash = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.content_hash ELSE NULL END,
-       name = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.name ELSE NULL END,
-       description = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.description ELSE NULL END,
-       image = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.image ELSE NULL END,
-       active = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.active ELSE NULL END,
-       x402_support = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.x402_support ELSE NULL END,
-       supported_trust = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.supported_trust ELSE NULL END`,
-    [agent.chain_id, agent.agent_id, agent.agent_uri, result.httpStatus, result.error, delay == null ? null : String(delay), attempts],
-  );
 }
 
+/** Run `fn` over `items` with bounded concurrency. Every worker finishes before the first error is rethrown. */
 async function mapPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
   let index = 0;
   const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
@@ -195,7 +217,19 @@ async function mapPool<T>(items: T[], concurrency: number, fn: (item: T) => Prom
       await fn(current);
     }
   });
-  await Promise.all(workers);
+  const results = await Promise.allSettled(workers);
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed) throw failed.reason;
+}
+
+/**
+ * Only a Postgres data error means the file itself cannot be stored (an odd string, a value out of
+ * range). Anything else, such as a dropped connection or a full pool, is the database's moment,
+ * not the file's, so the pass fails and the agent stays due.
+ */
+function isUnstorable(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code;
+  return typeof code === "string" && (code.startsWith("22") || code.startsWith("54"));
 }
 
 async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "error"> {
@@ -205,30 +239,27 @@ async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "e
     const attempts = result.ok ? 0 : agent.attempts + 1;
     try {
       await writeResult(agent, result, attempts);
-    } catch {
+    } catch (error) {
+      if (!isUnstorable(error)) throw error;
       outcome = "error";
-      try {
-        await writeResult(
-          agent,
-          { ok: false, error: "unstorable content", httpStatus: result.httpStatus },
-          Math.max(attempts, 1),
-        );
-      } catch {
-        // A single bad file must not stop the rest of the pass.
-      }
+      await writeResult(agent, { ok: false, error: "unstorable content", httpStatus: result.httpStatus }, Math.max(attempts, 1));
     }
   }
   return outcome;
 }
 
-async function selectAgents(): Promise<AgentTarget[]> {
-  const result = await getPool().query<AgentTarget>(DUE_AGENTS);
-  return result.rows;
+type Selection = { agents: AgentTarget[]; queueDepth: number };
+
+async function selectAgents(since: Date): Promise<Selection> {
+  const result = await getPool().query<AgentTarget & { queue_depth: string }>(DUE_AGENTS, [since, [...TERMINAL_FETCH_ERRORS]]);
+  const queueDepth = Number(result.rows[0]?.queue_depth ?? 0);
+  return { agents: result.rows.map(({ queue_depth: _depth, ...agent }) => agent), queueDepth };
 }
 
 async function runPass(): Promise<PassStats> {
   const started = Date.now();
-  const agents = await selectAgents();
+  const { agents, queueDepth } = await selectAgents(state.watermark);
+  state.queueDepth = queueDepth;
   const byUri = new Map<string, AgentTarget[]>();
   for (const agent of agents) {
     const group = byUri.get(agent.agent_uri) ?? [];
@@ -237,14 +268,22 @@ async function runPass(): Promise<PassStats> {
   }
   let fetched = 0;
   let failed = 0;
+  let groups = 0;
+  let skipped = 0;
   const concurrency = envInt("ENRICH_CONCURRENCY", 5);
   await mapPool([...byUri.entries()], concurrency, async ([uri, group]) => {
-    if (await isPaused()) return;
+    groups += 1;
+    if (groups % 10 === 1 && (await isPaused())) {
+      skipped += group.length;
+      return;
+    }
     const outcome = await fetchGroup(uri, group);
     if (outcome === "ok") fetched += group.length;
     else failed += group.length;
   });
-  await queueDepth();
+  // Everything due was taken and written: later passes only need what the indexer writes from here on.
+  // Otherwise the backlog is re-scanned next pass, which is the full scan until it drains.
+  if (skipped === 0 && queueDepth <= agents.length) state.watermark = new Date(started - WATERMARK_LAG_MS);
   return {
     at: new Date().toISOString(),
     selected: agents.length,
@@ -322,13 +361,19 @@ function startHealth(): void {
           paused: state.paused,
           queueDepth: state.queueDepth,
           lastPass: state.lastPass,
+          watermark: state.watermark.toISOString(),
         }),
       );
       return;
     }
     res.statusCode = 404;
     res.end();
-  }).listen(port, "127.0.0.1");
+  })
+    .on("error", (error: NodeJS.ErrnoException) => {
+      log("error", "health server failed", { port, error: error.message });
+      process.exit(1);
+    })
+    .listen(port, "127.0.0.1");
 }
 
 async function main(): Promise<void> {
