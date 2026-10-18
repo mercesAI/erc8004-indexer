@@ -28,3 +28,6 @@ dist/
 
 # Operator manual, kept local
 DEPLOY.md
+
+# Handoff for the app repository; holds the app_ro password
+HANDOFF-app.md
