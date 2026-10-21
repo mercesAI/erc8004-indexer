@@ -173,6 +173,9 @@ export async function runCycle(state: ChainState, addresses: Record<RegistryKind
       last = to;
       chunks += 1;
       cycleEvents += events.length;
+      // Report progress per range, not per cycle; a catch-up cycle can run for minutes.
+      state.lastBlock = last;
+      state.events += events.length;
     }
   } catch (error) {
     if (error instanceof CursorMoved) {
@@ -182,9 +185,6 @@ export async function runCycle(state: ChainState, addresses: Record<RegistryKind
       return;
     }
     throw error;
-  } finally {
-    state.lastBlock = last;
-    state.events += cycleEvents;
   }
   if (chunks === 0) {
     await pool.query("UPDATE erc8004.cursors SET head_block = $2, last_run_at = now(), last_error = NULL WHERE chain = $1", [
