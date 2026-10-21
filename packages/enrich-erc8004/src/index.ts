@@ -135,10 +135,15 @@ function budget() {
  */
 type HostStats = {
   concurrency: number;
-  /** Files per second seen in the last pass that fetched from this host. */
-  rate: number | null;
-  lastPass: { done: number; throttled: number; seconds: number } | null;
+  /** Seconds one fetch takes on this host, averaged over the last pass that used it. */
+  latency: number | null;
+  lastPass: { done: number; throttled: number; latency: number } | null;
 };
+
+/** Files per second this host can deliver at its current concurrency. */
+function hostRate(stats: HostStats): number | null {
+  return stats.latency == null ? null : stats.concurrency / Math.max(0.05, stats.latency);
+}
 
 const hosts = new Map<string, HostStats>();
 const hostSlots = new Map<string, { active: number; waiting: (() => void)[] }>();
@@ -146,7 +151,7 @@ const hostSlots = new Map<string, { active: number; waiting: (() => void)[] }>()
 function hostStats(host: string): HostStats {
   let stats = hosts.get(host);
   if (!stats) {
-    stats = { concurrency: Math.max(1, Math.min(2, budget().perHost)), rate: null, lastPass: null };
+    stats = { concurrency: Math.max(1, Math.min(4, budget().perHost)), latency: null, lastPass: null };
     hosts.set(host, stats);
   }
   return stats;
@@ -182,32 +187,116 @@ function hostShare(host: string): number {
   if (host === "data:" || host === "invalid") return Number.POSITIVE_INFINITY;
   const target = envInt("ENRICH_PASS_TARGET_SEC", 60);
   const stats = hostStats(host);
-  // An unmeasured host gets a modest first share; its rate is known after one pass.
-  const rate = stats.rate ?? 1;
+  // An unmeasured host gets a modest first share; its latency is known after one pass.
+  const rate = hostRate(stats) ?? 1;
   return Math.max(10, Math.round(rate * target));
 }
 
 const THROTTLE_ERRORS = new Set(["HTTP 429", "HTTP 503", "timeout"]);
 
-/** After a pass: record each host's rate, and move its concurrency toward what it tolerates. */
-function learnHosts(seen: Map<string, { done: number; throttled: number; firstAt: number; lastAt: number }>): void {
+type Seen = { done: number; throttled: number; busyMs: number };
+
+/** After a pass: record each host's latency, and move its concurrency toward what it tolerates. */
+function learnHosts(seen: Map<string, Seen>): void {
   const max = Math.max(1, budget().perHost);
   for (const [host, s] of seen) {
     if (host === "data:" || host === "invalid") continue;
     const stats = hostStats(host);
-    const seconds = Math.max(1, (s.lastAt - s.firstAt) / 1000);
-    stats.lastPass = { done: s.done, throttled: s.throttled, seconds };
-    if (s.done >= 5) stats.rate = s.done / seconds;
-    const throttleRatio = s.throttled / Math.max(1, s.done + s.throttled);
-    if (throttleRatio > 0.1) stats.concurrency = Math.max(1, Math.floor(stats.concurrency / 2));
+    const attempts = s.done + s.throttled;
+    const latency = attempts > 0 ? s.busyMs / attempts / 1000 : stats.latency ?? 1;
+    stats.lastPass = { done: s.done, throttled: s.throttled, latency: Math.round(latency * 100) / 100 };
+    if (attempts >= 5) stats.latency = latency;
+    const throttleRatio = s.throttled / Math.max(1, attempts);
+    if (attempts >= 10 && throttleRatio > 0.2) stats.concurrency = Math.max(1, Math.floor(stats.concurrency / 2));
     else if (s.throttled === 0 && stats.concurrency < max) stats.concurrency += 1;
   }
 }
 
 export function hostReport(): Record<string, { concurrency: number; perSec: number | null; lastPass: HostStats["lastPass"] }> {
   return Object.fromEntries(
-    [...hosts.entries()].map(([host, stats]) => [host, { concurrency: stats.concurrency, perSec: stats.rate == null ? null : Math.round(stats.rate * 10) / 10, lastPass: stats.lastPass }]),
+    [...hosts.entries()].map(([host, stats]) => {
+      const rate = hostRate(stats);
+      return [host, { concurrency: stats.concurrency, perSec: rate == null ? null : Math.round(rate * 10) / 10, lastPass: stats.lastPass }];
+    }),
   );
+}
+
+type Work = [string, AgentTarget[]];
+
+/**
+ * Run a pass: `concurrency` workers pick the next URI from any host that still has a free slot,
+ * so nobody queues behind one busy platform. Picking stops at `deadline`; fetches already running
+ * finish, and whatever was not started stays due for the next pass. Returns what was left.
+ */
+async function runWork(
+  work: Work[],
+  concurrency: number,
+  deadline: number,
+  onDone: (host: string, outcome: "ok" | "error" | "throttled", ms: number, agents: number) => void,
+): Promise<number> {
+  const queues = new Map<string, Work[]>();
+  for (const entry of work) {
+    const host = hostOf(entry[0]);
+    const queue = queues.get(host) ?? [];
+    queue.push(entry);
+    queues.set(host, queue);
+  }
+  const order = [...queues.keys()];
+  const active = new Map<string, number>();
+  let cursor = 0;
+  let waiters: (() => void)[] = [];
+  const wake = () => {
+    const list = waiters;
+    waiters = [];
+    for (const resolve of list) resolve();
+  };
+  const pick = (): Work | null => {
+    for (let i = 0; i < order.length; i++) {
+      const host = order[(cursor + i) % order.length] as string;
+      const queue = queues.get(host) as Work[];
+      if (queue.length === 0) continue;
+      const limit = host === "data:" || host === "invalid" ? Number.POSITIVE_INFINITY : hostStats(host).concurrency;
+      if ((active.get(host) ?? 0) >= limit) continue;
+      cursor = (cursor + i + 1) % order.length;
+      return queue.shift() as Work;
+    }
+    return null;
+  };
+  const remaining = () => {
+    let n = 0;
+    for (const queue of queues.values()) for (const entry of queue) n += entry[1].length;
+    return n;
+  };
+  let picks = 0;
+  const worker = async () => {
+    while (Date.now() < deadline) {
+      const next = pick();
+      if (!next) {
+        if (remaining() === 0) return;
+        await new Promise<void>((resolve) => {
+          waiters.push(resolve);
+          setTimeout(resolve, 1000);
+        });
+        continue;
+      }
+      picks += 1;
+      if (picks % 20 === 0 && (await isPaused())) return;
+      const host = hostOf(next[0]);
+      active.set(host, (active.get(host) ?? 0) + 1);
+      const begun = Date.now();
+      try {
+        const outcome = await fetchGroup(next[0], next[1]);
+        onDone(host, outcome, Date.now() - begun, next[1].length);
+      } finally {
+        active.set(host, (active.get(host) ?? 0) - 1);
+        wake();
+      }
+    }
+  };
+  const results = await Promise.allSettled(Array.from({ length: Math.min(concurrency, work.length) }, worker));
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed) throw failed.reason;
+  return remaining();
 }
 
 async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number): Promise<void> {
@@ -314,22 +403,6 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
   }
 }
 
-/** Run `fn` over `items` with bounded concurrency. Every worker finishes before the first error is rethrown. */
-async function mapPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
-  let index = 0;
-  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-    while (index < items.length) {
-      const current = items[index];
-      index += 1;
-      if (!current) break;
-      await fn(current);
-    }
-  });
-  const results = await Promise.allSettled(workers);
-  const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-  if (failed) throw failed.reason;
-}
-
 /**
  * Only a Postgres data error means the file itself cannot be stored (an odd string, a value out of
  * range). Anything else, such as a dropped connection or a full pool, is the database's moment,
@@ -396,30 +469,22 @@ async function runPass(): Promise<PassStats> {
       left += entry[1].length;
     }
   }
-  const selected = agents.length - left;
   let fetched = 0;
   let failed = 0;
-  let groups = 0;
-  let skipped = 0;
-  const seen = new Map<string, { done: number; throttled: number; firstAt: number; lastAt: number }>();
-  const concurrency = budget().concurrency;
-  await mapPool(work, concurrency, async ([uri, group]) => {
-    groups += 1;
-    if (groups % 10 === 1 && (await isPaused())) {
-      skipped += group.length;
-      return;
-    }
-    const host = hostOf(uri);
-    const begun = Date.now();
-    const outcome = await fetchGroup(uri, group);
-    const s = seen.get(host) ?? { done: 0, throttled: 0, firstAt: begun, lastAt: begun };
+  const seen = new Map<string, Seen>();
+  const deadline = started + envInt("ENRICH_PASS_TARGET_SEC", 60) * 1000;
+  const notStarted = await runWork(work, budget().concurrency, deadline, (host, outcome, ms, agents) => {
+    const s = seen.get(host) ?? { done: 0, throttled: 0, busyMs: 0 };
     if (outcome === "throttled") s.throttled += 1;
     else s.done += 1;
-    s.lastAt = Date.now();
+    s.busyMs += ms;
     seen.set(host, s);
-    if (outcome === "ok") fetched += group.length;
-    else failed += group.length;
+    if (outcome === "ok") fetched += agents;
+    else failed += agents;
   });
+  left += notStarted;
+  const selected = agents.length - left;
+  const skipped = 0;
   learnHosts(seen);
   // Everything due was taken and written: later passes only need what the indexer writes from here on.
   // Otherwise the backlog is re-scanned next pass, which is the full scan until it drains.
