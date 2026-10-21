@@ -3,7 +3,7 @@ import { envString } from "./env.js";
 import { log } from "./logger.js";
 
 /** Sent to The Graph and 8004scan. Identifies this indexer honestly; both accept it. */
-export const HTTP_USER_AGENT = "merces-erc8004-indexer/1.0 (+https://github.com/0xVitalii/merces-data)";
+export const HTTP_USER_AGENT = "merces-erc8004-indexer/1.0 (+https://github.com/mercesAI/erc8004-indexer)";
 
 const PAGE_FIELDS = new Set(["agents", "agentRegistrationFiles", "feedbacks", "validations"]);
 
