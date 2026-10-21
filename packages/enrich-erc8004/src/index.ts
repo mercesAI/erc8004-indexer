@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { envInt, getPool, log } from "@merces/shared";
+import { envInt, envString, getPool, log } from "@merces/shared";
 import { isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, type ParsedRegistration } from "./fetchUri.js";
 
 type AgentTarget = {
@@ -15,6 +15,8 @@ type PassStats = {
   fetched: number;
   failed: number;
   durationMs: number;
+  /** True when more agents were due than this pass could take; the next pass starts at once. */
+  backlog: boolean;
 };
 
 const state = {
@@ -96,11 +98,57 @@ const DUE_AGENTS = `
   )
   SELECT chain_id, agent_id, agent_uri, attempts, queue_depth::text AS queue_depth
   FROM ranked
-  WHERE (agent_uri LIKE 'data:%' AND rn <= 200)
-     OR (agent_uri NOT LIKE 'data:%' AND rn <= 40)
+  WHERE (agent_uri LIKE 'data:%' AND rn <= $3)
+     OR (agent_uri NOT LIKE 'data:%' AND rn <= $4)
   ORDER BY (agent_uri LIKE 'data:%') DESC, priority, registered_at DESC NULLS LAST
-  LIMIT 500
+  LIMIT $5
 `;
+
+/**
+ * Per-pass budget. The defaults are gentle; a server with a backlog runs with
+ * ENRICH_NETWORK_PER_CHAIN=1500 ENRICH_DATA_PER_CHAIN=3000 ENRICH_PASS_LIMIT=5000 ENRICH_CONCURRENCY=16.
+ */
+function budget() {
+  return {
+    dataPerChain: envInt("ENRICH_DATA_PER_CHAIN", 200),
+    networkPerChain: envInt("ENRICH_NETWORK_PER_CHAIN", 40),
+    passLimit: envInt("ENRICH_PASS_LIMIT", 500),
+    concurrency: envInt("ENRICH_CONCURRENCY", 5),
+    perHost: envInt("ENRICH_PER_HOST_CONCURRENCY", 4),
+  };
+}
+
+/**
+ * At most `perHost` fetches in flight against one host. One platform can own hundreds of
+ * thousands of registration files (Central City on Base); the overall concurrency would
+ * otherwise land on that one server and turn into 503s and timeouts.
+ */
+const hostSlots = new Map<string, { active: number; waiting: (() => void)[] }>();
+
+function hostOf(uri: string): string {
+  if (uri.startsWith("data:")) return "data:";
+  try {
+    return new URL(uri.startsWith("ipfs://") ? envString("IPFS_GATEWAY") : uri).host;
+  } catch {
+    return "invalid";
+  }
+}
+
+async function withHostSlot<T>(host: string, limit: number, fn: () => Promise<T>): Promise<T> {
+  if (host === "data:" || host === "invalid") return fn();
+  const slot = hostSlots.get(host) ?? { active: 0, waiting: [] };
+  hostSlots.set(host, slot);
+  if (slot.active >= limit) await new Promise<void>((resolve) => slot.waiting.push(resolve));
+  slot.active += 1;
+  try {
+    return await fn();
+  } finally {
+    slot.active -= 1;
+    const next = slot.waiting.shift();
+    if (next) next();
+    if (slot.active === 0 && slot.waiting.length === 0) hostSlots.delete(host);
+  }
+}
 
 async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number): Promise<void> {
   const client = await getPool().connect();
@@ -233,7 +281,7 @@ function isUnstorable(error: unknown): boolean {
 }
 
 async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "error"> {
-  const result = await resolveUri(uri);
+  const result = await withHostSlot(hostOf(uri), budget().perHost, () => resolveUri(uri));
   let outcome: "ok" | "error" = result.ok ? "ok" : "error";
   for (const agent of agents) {
     const attempts = result.ok ? 0 : agent.attempts + 1;
@@ -251,7 +299,14 @@ async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "e
 type Selection = { agents: AgentTarget[]; queueDepth: number };
 
 async function selectAgents(since: Date): Promise<Selection> {
-  const result = await getPool().query<AgentTarget & { queue_depth: string }>(DUE_AGENTS, [since, [...TERMINAL_FETCH_ERRORS]]);
+  const b = budget();
+  const result = await getPool().query<AgentTarget & { queue_depth: string }>(DUE_AGENTS, [
+    since,
+    [...TERMINAL_FETCH_ERRORS],
+    b.dataPerChain,
+    b.networkPerChain,
+    b.passLimit,
+  ]);
   const queueDepth = Number(result.rows[0]?.queue_depth ?? 0);
   return { agents: result.rows.map(({ queue_depth: _depth, ...agent }) => agent), queueDepth };
 }
@@ -270,7 +325,7 @@ async function runPass(): Promise<PassStats> {
   let failed = 0;
   let groups = 0;
   let skipped = 0;
-  const concurrency = envInt("ENRICH_CONCURRENCY", 5);
+  const concurrency = budget().concurrency;
   await mapPool([...byUri.entries()], concurrency, async ([uri, group]) => {
     groups += 1;
     if (groups % 10 === 1 && (await isPaused())) {
@@ -290,6 +345,7 @@ async function runPass(): Promise<PassStats> {
     fetched,
     failed,
     durationMs: Date.now() - started,
+    backlog: queueDepth > agents.length,
   };
 }
 
@@ -390,7 +446,8 @@ async function main(): Promise<void> {
       state.lastPass = stats;
       log("info", "pass", stats);
       failures = 0;
-      const until = Date.now() + 60_000;
+      // With a backlog, go straight to the next pass; otherwise look again in a minute.
+      const until = Date.now() + (stats.backlog ? 2000 : 60_000);
       while (Date.now() < until) {
         await runJobs();
         if (await isPaused()) break;
