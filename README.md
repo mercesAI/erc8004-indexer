@@ -2,7 +2,7 @@
 
 A self-hosted indexer for [ERC-8004 (Trustless Agents)](https://eips.ethereum.org/EIPS/eip-8004) with an operator dashboard. It reads the Identity, Reputation, and Validation registries on several EVM chains, downloads each agent's registration file, and serves the result from Postgres through a read-only schema that an app can query directly.
 
-It powers the agent catalog of [Merces](https://merces.ai). The app lives in a separate repository and only ever sees schema `read`.
+It powers the agent catalog of [merces](https://merces.ai). The app lives in a separate repository and only ever sees schema `read`.
 
 ![Operator dashboard](docs/images/dashboard-overview.png)
 
