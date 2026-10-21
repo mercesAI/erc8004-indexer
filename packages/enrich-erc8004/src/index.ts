@@ -111,10 +111,10 @@ const DUE_AGENTS = `
 `;
 
 /**
- * Per-pass budget. The defaults are gentle; a server with a backlog runs with
- * ENRICH_NETWORK_PER_CHAIN=1500 ENRICH_NETWORK_PER_HOST=400 ENRICH_DATA_PER_CHAIN=3000
- * ENRICH_PASS_LIMIT=5000 ENRICH_CONCURRENCY=24 ENRICH_PER_HOST_CONCURRENCY=8.
- * Size ENRICH_NETWORK_PER_HOST to about one minute of the slowest host's throughput.
+ * Per-pass budget. The SQL caps are upper bounds on what a pass may look at; each host's real
+ * share and concurrency are learned (see hostShare and learnHosts). The defaults are gentle; a
+ * server with a backlog runs with ENRICH_NETWORK_PER_CHAIN=3000 ENRICH_NETWORK_PER_HOST=3000
+ * ENRICH_DATA_PER_CHAIN=3000 ENRICH_PASS_LIMIT=12000 ENRICH_CONCURRENCY=24 ENRICH_PER_HOST_CONCURRENCY=8.
  */
 function budget() {
   return {
@@ -128,11 +128,29 @@ function budget() {
 }
 
 /**
- * At most `perHost` fetches in flight against one host. One platform can own hundreds of
- * thousands of registration files (Central City on Base); the overall concurrency would
- * otherwise land on that one server and turn into 503s and timeouts.
+ * Every host gets its own concurrency and its own share of a pass, both learned from how it
+ * answered last time. A host that returns 429s or times out loses concurrency; a clean host gains
+ * it, up to ENRICH_PER_HOST_CONCURRENCY. A pass gives each host about ENRICH_PASS_TARGET_SEC worth
+ * of work at its measured rate, so a slow platform never holds the others back.
  */
+type HostStats = {
+  concurrency: number;
+  /** Files per second seen in the last pass that fetched from this host. */
+  rate: number | null;
+  lastPass: { done: number; throttled: number; seconds: number } | null;
+};
+
+const hosts = new Map<string, HostStats>();
 const hostSlots = new Map<string, { active: number; waiting: (() => void)[] }>();
+
+function hostStats(host: string): HostStats {
+  let stats = hosts.get(host);
+  if (!stats) {
+    stats = { concurrency: Math.max(1, Math.min(2, budget().perHost)), rate: null, lastPass: null };
+    hosts.set(host, stats);
+  }
+  return stats;
+}
 
 function hostOf(uri: string): string {
   if (uri.startsWith("data:")) return "data:";
@@ -143,11 +161,11 @@ function hostOf(uri: string): string {
   }
 }
 
-async function withHostSlot<T>(host: string, limit: number, fn: () => Promise<T>): Promise<T> {
+async function withHostSlot<T>(host: string, fn: () => Promise<T>): Promise<T> {
   if (host === "data:" || host === "invalid") return fn();
   const slot = hostSlots.get(host) ?? { active: 0, waiting: [] };
   hostSlots.set(host, slot);
-  if (slot.active >= limit) await new Promise<void>((resolve) => slot.waiting.push(resolve));
+  while (slot.active >= hostStats(host).concurrency) await new Promise<void>((resolve) => slot.waiting.push(resolve));
   slot.active += 1;
   try {
     return await fn();
@@ -157,6 +175,39 @@ async function withHostSlot<T>(host: string, limit: number, fn: () => Promise<T>
     if (next) next();
     if (slot.active === 0 && slot.waiting.length === 0) hostSlots.delete(host);
   }
+}
+
+/** How many URI groups of `host` this pass takes: about one target window at the measured rate. */
+function hostShare(host: string): number {
+  if (host === "data:" || host === "invalid") return Number.POSITIVE_INFINITY;
+  const target = envInt("ENRICH_PASS_TARGET_SEC", 60);
+  const stats = hostStats(host);
+  // An unmeasured host gets a modest first share; its rate is known after one pass.
+  const rate = stats.rate ?? 1;
+  return Math.max(10, Math.round(rate * target));
+}
+
+const THROTTLE_ERRORS = new Set(["HTTP 429", "HTTP 503", "timeout"]);
+
+/** After a pass: record each host's rate, and move its concurrency toward what it tolerates. */
+function learnHosts(seen: Map<string, { done: number; throttled: number; firstAt: number; lastAt: number }>): void {
+  const max = Math.max(1, budget().perHost);
+  for (const [host, s] of seen) {
+    if (host === "data:" || host === "invalid") continue;
+    const stats = hostStats(host);
+    const seconds = Math.max(1, (s.lastAt - s.firstAt) / 1000);
+    stats.lastPass = { done: s.done, throttled: s.throttled, seconds };
+    if (s.done >= 5) stats.rate = s.done / seconds;
+    const throttleRatio = s.throttled / Math.max(1, s.done + s.throttled);
+    if (throttleRatio > 0.1) stats.concurrency = Math.max(1, Math.floor(stats.concurrency / 2));
+    else if (s.throttled === 0 && stats.concurrency < max) stats.concurrency += 1;
+  }
+}
+
+export function hostReport(): Record<string, { concurrency: number; perSec: number | null; lastPass: HostStats["lastPass"] }> {
+  return Object.fromEntries(
+    [...hosts.entries()].map(([host, stats]) => [host, { concurrency: stats.concurrency, perSec: stats.rate == null ? null : Math.round(stats.rate * 10) / 10, lastPass: stats.lastPass }]),
+  );
 }
 
 async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number): Promise<void> {
@@ -289,9 +340,9 @@ function isUnstorable(error: unknown): boolean {
   return typeof code === "string" && (code.startsWith("22") || code.startsWith("54"));
 }
 
-async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "error"> {
-  const result = await withHostSlot(hostOf(uri), budget().perHost, () => resolveUri(uri));
-  let outcome: "ok" | "error" = result.ok ? "ok" : "error";
+async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "error" | "throttled"> {
+  const result = await withHostSlot(hostOf(uri), () => resolveUri(uri));
+  let outcome: "ok" | "error" | "throttled" = result.ok ? "ok" : THROTTLE_ERRORS.has(result.error) ? "throttled" : "error";
   for (const agent of agents) {
     const attempts = result.ok ? 0 : agent.attempts + 1;
     try {
@@ -331,31 +382,55 @@ async function runPass(): Promise<PassStats> {
     group.push(agent);
     byUri.set(agent.agent_uri, group);
   }
+  // Each host gets about one target window of work at its measured rate; the rest stays due.
+  const taken = new Map<string, number>();
+  const work: [string, AgentTarget[]][] = [];
+  let left = 0;
+  for (const entry of byUri) {
+    const host = hostOf(entry[0]);
+    const n = taken.get(host) ?? 0;
+    if (n < hostShare(host)) {
+      taken.set(host, n + 1);
+      work.push(entry);
+    } else {
+      left += entry[1].length;
+    }
+  }
+  const selected = agents.length - left;
   let fetched = 0;
   let failed = 0;
   let groups = 0;
   let skipped = 0;
+  const seen = new Map<string, { done: number; throttled: number; firstAt: number; lastAt: number }>();
   const concurrency = budget().concurrency;
-  await mapPool([...byUri.entries()], concurrency, async ([uri, group]) => {
+  await mapPool(work, concurrency, async ([uri, group]) => {
     groups += 1;
     if (groups % 10 === 1 && (await isPaused())) {
       skipped += group.length;
       return;
     }
+    const host = hostOf(uri);
+    const begun = Date.now();
     const outcome = await fetchGroup(uri, group);
+    const s = seen.get(host) ?? { done: 0, throttled: 0, firstAt: begun, lastAt: begun };
+    if (outcome === "throttled") s.throttled += 1;
+    else s.done += 1;
+    s.lastAt = Date.now();
+    seen.set(host, s);
     if (outcome === "ok") fetched += group.length;
     else failed += group.length;
   });
+  learnHosts(seen);
   // Everything due was taken and written: later passes only need what the indexer writes from here on.
   // Otherwise the backlog is re-scanned next pass, which is the full scan until it drains.
-  if (skipped === 0 && queueDepth <= agents.length) state.watermark = new Date(started - WATERMARK_LAG_MS);
+  if (skipped === 0 && left === 0 && queueDepth <= agents.length) state.watermark = new Date(started - WATERMARK_LAG_MS);
   return {
     at: new Date().toISOString(),
-    selected: agents.length,
+    selected,
     fetched,
     failed,
     durationMs: Date.now() - started,
-    backlog: queueDepth > agents.length,
+    backlog: left > 0 || queueDepth > agents.length,
   };
 }
 
@@ -428,6 +503,7 @@ function startHealth(): void {
           queueDepth: state.queueDepth,
           lastPass: state.lastPass,
           watermark: state.watermark.toISOString(),
+          hosts: hostReport(),
         }),
       );
       return;
