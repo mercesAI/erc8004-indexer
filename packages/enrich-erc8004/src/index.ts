@@ -93,25 +93,34 @@ const DUE_AGENTS = `
              PARTITION BY chain_id, (agent_uri LIKE 'data:%')
              ORDER BY priority, registered_at DESC NULLS LAST
            ) AS rn,
+           -- A pass lasts as long as its slowest host. Capping each host keeps one slow platform
+           -- from holding every other platform's fetches back.
+           row_number() OVER (
+             PARTITION BY chain_id, substring(agent_uri from '^https?://([^/]+)')
+             ORDER BY priority, registered_at DESC NULLS LAST
+           ) AS host_rn,
            count(*) OVER () AS queue_depth
     FROM due
   )
   SELECT chain_id, agent_id, agent_uri, attempts, queue_depth::text AS queue_depth
   FROM ranked
   WHERE (agent_uri LIKE 'data:%' AND rn <= $3)
-     OR (agent_uri NOT LIKE 'data:%' AND rn <= $4)
+     OR (agent_uri NOT LIKE 'data:%' AND rn <= $4 AND host_rn <= $6)
   ORDER BY (agent_uri LIKE 'data:%') DESC, priority, registered_at DESC NULLS LAST
   LIMIT $5
 `;
 
 /**
  * Per-pass budget. The defaults are gentle; a server with a backlog runs with
- * ENRICH_NETWORK_PER_CHAIN=1500 ENRICH_DATA_PER_CHAIN=3000 ENRICH_PASS_LIMIT=5000 ENRICH_CONCURRENCY=16.
+ * ENRICH_NETWORK_PER_CHAIN=1500 ENRICH_NETWORK_PER_HOST=400 ENRICH_DATA_PER_CHAIN=3000
+ * ENRICH_PASS_LIMIT=5000 ENRICH_CONCURRENCY=24 ENRICH_PER_HOST_CONCURRENCY=8.
+ * Size ENRICH_NETWORK_PER_HOST to about one minute of the slowest host's throughput.
  */
 function budget() {
   return {
     dataPerChain: envInt("ENRICH_DATA_PER_CHAIN", 200),
     networkPerChain: envInt("ENRICH_NETWORK_PER_CHAIN", 40),
+    networkPerHost: envInt("ENRICH_NETWORK_PER_HOST", 40),
     passLimit: envInt("ENRICH_PASS_LIMIT", 500),
     concurrency: envInt("ENRICH_CONCURRENCY", 5),
     perHost: envInt("ENRICH_PER_HOST_CONCURRENCY", 4),
@@ -306,6 +315,7 @@ async function selectAgents(since: Date): Promise<Selection> {
     b.dataPerChain,
     b.networkPerChain,
     b.passLimit,
+    b.networkPerHost,
   ]);
   const queueDepth = Number(result.rows[0]?.queue_depth ?? 0);
   return { agents: result.rows.map(({ queue_depth: _depth, ...agent }) => agent), queueDepth };
