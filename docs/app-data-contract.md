@@ -89,7 +89,7 @@ All of these are views. `SELECT` only. They update as the collectors run. A quer
 | `active` | boolean or null | From the file, when the file has a boolean |
 | `x402_support` | boolean or null | From the file |
 | `supported_trust` | text[] or null | From the file |
-| `fetch_status` | text or null | Null means not fetched yet. `ok` or `error` after a fetch |
+| `fetch_status` | text or null | Null means not fetched yet. `pending` means scheduled for later (treat like null). `ok` or `error` after a fetch |
 | `fetch_error` | text or null | Set when `fetch_status` is `error` |
 | `fetched_at` | timestamptz or null | Last fetch attempt |
 | `content_hash` | text or null | Hash of the file body when the fetch succeeded |
@@ -127,7 +127,7 @@ A publisher filter, chip, or count must use `publisher_status = 'verified'`. `re
 
 `read.publisher_agents`: one row per attributed agent, with `publisher_key`, `publisher_name`, `publisher_status`, `publisher_proof` (`registrations`, `owner_field`, `minter`, `host`, or `content`), the agent columns a list needs (`chain_id`, `chain_key`, `chain_name`, `agent_id`, `owner`, `agent_uri`, `uri_kind`, `agent_wallet`, `registered_at`, `feedback_count`, `last_feedback_at`), and `name`, `description`, `image`, `active`, `fetch_status` from the file. Use it for a publisher's list: it is indexed for `publisher_key` and `chain_id` ordered by `registered_at DESC`. `read.agents` carries the same three publisher columns for a detail page.
 
-Attribution lags a fetch by at most one enrich pass, about a minute. A file that does not prove its agent yet is fetched again after 1 hour, 6 hours, 1 day and 7 days, so a new Central City agent usually moves from `claimed` to `verified` within the hour.
+Attribution lags a fetch by at most one enrich pass, about a minute. A file that does not prove its agent yet is fetched again after 1 hour, 6 hours, 1 day and 7 days. Central City writes its file before the chain has given the agent its id and fills the id in one to three hours later, so its new agents are first fetched three hours after registration (`fetch_status = 'pending'` until then) and usually arrive `verified` at once.
 
 ### Other views
 

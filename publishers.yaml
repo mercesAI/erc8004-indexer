@@ -14,6 +14,10 @@
 #
 # `hosts` are exact host names, lowercase, without a scheme or path. Never list shared hosting
 # (vercel.app, github, S3 in general, IPFS gateways): only the full name a single platform controls.
+# A publisher that lists both `hosts` and `minters` is proven by a minter only together with one of its
+# hosts, because one minting contract can serve several platforms (see Exquisite Land and Normies).
+# `fetch_after_minutes` leaves a new agent's file alone that long before the first fetch, for a
+# platform that writes the file before the chain has given the agent its id.
 # Order matters when two publishers match: the first verified match wins, then the first claimed.
 
 - key: centralcity
@@ -22,6 +26,8 @@
   kind: platform
   hosts: [centralcity.ai]
   proof: registrations
+  # The file gets its agent id one to three hours after registration (measured 22 Oct 2026).
+  fetch_after_minutes: 180
 
 - key: evoevo
   name: EvoEvo
@@ -63,11 +69,27 @@
   hosts: [api.acp.virtuals.io]
   proof: registrations
 
+# One minting contract on Ethereum serves several art drops; each is told apart by its host.
 - key: exquisite-land
   name: Exquisite Land
   website: https://exquisite.land
   kind: art-drop
   hosts: [agents.exquisite.land]
+  minters: ["0xde152afb7db5373f34876e1499fbd893a82dd336"]
+
+- key: normies
+  name: Normies
+  website: https://normies.art
+  kind: art-drop
+  hosts: [api.normies.art]
+  minters: ["0xde152afb7db5373f34876e1499fbd893a82dd336"]
+
+- key: signalbound
+  name: Signalbound
+  website: https://signalbound.art
+  kind: art-drop
+  hosts: [signalbound.art]
+  proof: registrations
   minters: ["0xde152afb7db5373f34876e1499fbd893a82dd336"]
 
 # Claimed only: the files carry nothing that ties them to the chain.

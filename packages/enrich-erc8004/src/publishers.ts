@@ -18,7 +18,7 @@ import { findRepoRoot, getPool, log } from "@merces/shared";
 export const PUBLISHERS_FILE = "publishers.yaml";
 
 /** Bump when attribute() changes meaning, so the next run recomputes every agent. */
-export const ATTRIBUTION_VERSION = 2;
+export const ATTRIBUTION_VERSION = 3;
 
 export type Proof = "registrations" | "owner_field";
 
@@ -43,6 +43,8 @@ export type Publisher = {
   proof?: Proof;
   minters: string[];
   claims: Claims;
+  /** Leave a new agent's file alone this long: the platform writes it before the chain has given the id. */
+  fetchAfterMinutes?: number;
 };
 
 export type Attribution = {
@@ -93,10 +95,16 @@ export function parsePublishers(text: string): Publisher[] {
       if (list.length > 0) claims[field] = field.endsWith("hosts") ? list.map((host) => host.toLowerCase()) : list;
     }
     if (hosts.length === 0 && minters.length === 0 && Object.keys(claims).length === 0) throw new Error(`${where}: needs hosts, minters, or claims`);
+    const after = p.fetch_after_minutes;
+    if (after !== undefined && (typeof after !== "number" || !Number.isInteger(after) || after <= 0 || after > 7 * 24 * 60)) {
+      throw new Error(`${where}: fetch_after_minutes must be a whole number of minutes, at most a week`);
+    }
+    if (after !== undefined && hosts.length === 0) throw new Error(`${where}: fetch_after_minutes needs hosts`);
     const publisher: Publisher = { key, name: p.name, hosts, minters, claims };
     if (typeof p.website === "string" && p.website) publisher.website = p.website;
     if (typeof p.kind === "string" && p.kind) publisher.kind = p.kind;
     if (proof !== undefined) publisher.proof = proof;
+    if (after !== undefined) publisher.fetchAfterMinutes = after;
     return publisher;
   });
 }
@@ -128,13 +136,24 @@ export type AgentRow = {
   services: unknown;
 };
 
-function hostOf(url: string | null | undefined): string | null {
+/** The host of an http(s) URL, lowercase, or null for anything else. */
+export function uriHost(url: string | null | undefined): string | null {
   if (!url || !/^https?:\/\//i.test(url)) return null;
   try {
     return new URL(url).hostname.toLowerCase().replace(/\.$/, "");
   } catch {
     return null;
   }
+}
+
+/** Seconds to wait before the first fetch of an agent, by URI host, for publishers that ask for it. */
+export function fetchDelays(): Record<string, number> {
+  const delays: Record<string, number> = {};
+  for (const p of loadPublishers().publishers) {
+    if (p.fetchAfterMinutes === undefined) continue;
+    for (const host of p.hosts) delays[host] = p.fetchAfterMinutes * 60;
+  }
+  return delays;
 }
 
 /**
@@ -166,13 +185,13 @@ function matchesClaims(row: AgentRow, claims: Claims): boolean {
   if (claims.name?.some((value) => name === lower(value))) return true;
   if (claims.name_prefix?.some((prefix) => name.startsWith(lower(prefix)))) return true;
   if (claims.trust && row.supported_trust?.some((marker) => claims.trust?.some((want) => lower(want) === lower(marker)))) return true;
-  if (claims.image_hosts?.includes(hostOf(row.image) ?? "")) return true;
+  if (claims.image_hosts?.includes(uriHost(row.image) ?? "")) return true;
   if ((claims.service_names || claims.endpoint_hosts) && Array.isArray(row.services)) {
     for (const service of row.services) {
       if (!service || typeof service !== "object") continue;
       const s = service as Record<string, unknown>;
       if (typeof s.name === "string" && claims.service_names?.some((want) => lower(want) === lower(s.name as string))) return true;
-      if (typeof s.endpoint === "string" && claims.endpoint_hosts?.includes(hostOf(s.endpoint) ?? "")) return true;
+      if (typeof s.endpoint === "string" && claims.endpoint_hosts?.includes(uriHost(s.endpoint) ?? "")) return true;
     }
   }
   return false;
@@ -185,16 +204,18 @@ function matchesClaims(row: AgentRow, claims: Claims): boolean {
  * A host match needs the file to have come from that host too (final_host, when known), so an open
  * redirect on the publisher's domain cannot lend its name to a file served elsewhere. The minter and
  * owner-field proofs use registered_by only: the current owner can be anyone an agent was gifted to.
+ * A minter proves a publisher that also lists hosts only together with one of those hosts, because a
+ * minting contract can serve several platforms.
  */
 export function attribute(row: AgentRow, publishers: Publisher[]): Attribution | null {
-  const uriHost = hostOf(row.agent_uri);
+  const host = uriHost(row.agent_uri);
   const finalHost = row.final_host?.toLowerCase() ?? null;
   const minter = row.registered_by?.toLowerCase() ?? null;
   const fileOk = row.fetch_status === "ok";
   let claimed: Attribution | null = null;
   for (const p of publishers) {
-    if (minter && p.minters.includes(minter)) return { key: p.key, status: "verified", proof: "minter" };
-    const onHost = uriHost !== null && p.hosts.includes(uriHost);
+    const onHost = host !== null && p.hosts.includes(host);
+    if (minter && p.minters.includes(minter) && (p.hosts.length === 0 || onHost)) return { key: p.key, status: "verified", proof: "minter" };
     const served = onHost && fileOk && (finalHost === null || p.hosts.includes(finalHost));
     if (served && p.proof === "registrations" && namesAgent(row.registrations, row.chain_id, row.agent_id)) {
       return { key: p.key, status: "verified", proof: "registrations" };

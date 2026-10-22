@@ -1,13 +1,17 @@
 import { createServer } from "node:http";
 import { envInt, getPool, log } from "@merces/shared";
 import { gateways, ipfsPath, IPFS_URI_SQL_PATTERN, isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, THROTTLE_RETRY_MS, type ParsedRegistration } from "./fetchUri.js";
-import { publisherState, runPublishers } from "./publishers.js";
+import { fetchDelays, publisherState, runPublishers, uriHost } from "./publishers.js";
 
 type AgentTarget = {
   chain_id: number;
   agent_id: string;
   agent_uri: string;
   attempts: number;
+  /** Unix seconds of the registration, as text; null when only a transfer has been seen. */
+  registered_at: string | null;
+  /** Whether a registration_files row exists already (fetched, failed, or pending). */
+  has_file: boolean;
 };
 
 type PassStats = {
@@ -15,6 +19,8 @@ type PassStats = {
   selected: number;
   fetched: number;
   failed: number;
+  /** New agents whose publisher asks for a wait before the first fetch; they come back when due. */
+  deferred: number;
   durationMs: number;
   /** True when more agents were due than this pass could take; the next pass starts at once. */
   backlog: boolean;
@@ -76,6 +82,7 @@ const DUE_SET = `
              WHEN a.agent_uri ~* $9 THEN 'ipfs'
              ELSE lower(substring(a.agent_uri from '^https?://([^/]+)'))
            END AS host,
+           (r.agent_id IS NOT NULL) AS has_file,
            CASE
              WHEN r.agent_id IS NULL OR r.agent_uri IS DISTINCT FROM a.agent_uri THEN 0
              ELSE COALESCE(r.attempts, 0)
@@ -122,7 +129,7 @@ const DUE_AGENTS = `${DUE_SET},
     LEFT JOIN jsonb_each_text($7::jsonb) AS share(host, n) ON share.host = b.host
     WHERE b.agent_uri LIKE 'data:%' OR b.host_rn <= LEAST($6::int, COALESCE(share.n::int, $8::int))
   )
-  SELECT chain_id, agent_id, agent_uri, attempts, queue_depth::text AS queue_depth
+  SELECT chain_id, agent_id, agent_uri, attempts, registered_at::text AS registered_at, has_file, queue_depth::text AS queue_depth
   FROM ranked
   WHERE (agent_uri LIKE 'data:%' AND rn <= $3)
      OR (agent_uri NOT LIKE 'data:%' AND rn <= $4)
@@ -564,8 +571,12 @@ async function runPass(): Promise<PassStats> {
   const started = Date.now();
   const { agents, queueDepth } = await selectAgents(state.watermark);
   state.queueDepth = queueDepth;
+  // A publisher may ask that a new agent's file is left alone for a while (publishers.yaml,
+  // fetch_after_minutes): a 'pending' row holds its place and comes back through next_retry_at.
+  const deferred = await deferYoungAgents(agents);
   const byUri = new Map<string, AgentTarget[]>();
   for (const agent of agents) {
+    if (deferred.has(agent)) continue;
     const group = byUri.get(agent.agent_uri) ?? [];
     group.push(agent);
     byUri.set(agent.agent_uri, group);
@@ -612,9 +623,41 @@ async function runPass(): Promise<PassStats> {
     selected,
     fetched,
     failed,
+    deferred: deferred.size,
     durationMs: Date.now() - started,
     backlog: left > 0 || queueDepth > agents.length,
   };
+}
+
+/**
+ * Agents that have no file row yet, sit on a host with a fetch delay, and are younger than it: write a
+ * 'pending' row due at registration + delay instead of fetching now. Returns the agents set aside.
+ */
+async function deferYoungAgents(agents: AgentTarget[]): Promise<Set<AgentTarget>> {
+  const delays = fetchDelays();
+  const deferred = new Set<AgentTarget>();
+  const dueAt: string[] = [];
+  if (Object.keys(delays).length === 0) return deferred;
+  const now = Date.now() / 1000;
+  for (const agent of agents) {
+    if (agent.has_file || agent.registered_at === null) continue;
+    const delay = delays[uriHost(agent.agent_uri) ?? ""];
+    if (!delay) continue;
+    const registered = Number(agent.registered_at);
+    if (registered + delay <= now) continue;
+    deferred.add(agent);
+    dueAt.push(new Date((registered + delay) * 1000).toISOString());
+  }
+  if (deferred.size === 0) return deferred;
+  const list = [...deferred];
+  await getPool().query(
+    `INSERT INTO enrich.registration_files (chain_id, agent_id, agent_uri, fetch_status, next_retry_at, attempts)
+     SELECT u.chain, u.agent, u.uri, 'pending', u.due_at::timestamptz, 0
+     FROM unnest($1::int[], $2::numeric[], $3::text[], $4::text[]) AS u(chain, agent, uri, due_at)
+     ON CONFLICT (chain_id, agent_id) DO NOTHING`,
+    [list.map((a) => a.chain_id), list.map((a) => a.agent_id), list.map((a) => a.agent_uri), dueAt],
+  );
+  return deferred;
 }
 
 async function claimJobs(): Promise<{ id: string; payload: { chainId?: number; agentId?: string } }[]> {
@@ -657,7 +700,7 @@ async function runJobs(): Promise<void> {
       const chainId = Number(job.payload.chainId);
       const agentId = String(job.payload.agentId ?? "");
       const found = await getPool().query<AgentTarget>(
-        `SELECT chain_id, agent_id::text AS agent_id, agent_uri, 0 AS attempts
+        `SELECT chain_id, agent_id::text AS agent_id, agent_uri, 0 AS attempts, registered_at::text AS registered_at, true AS has_file
          FROM erc8004.agents WHERE chain_id = $1 AND agent_id = $2`,
         [chainId, agentId],
       );
