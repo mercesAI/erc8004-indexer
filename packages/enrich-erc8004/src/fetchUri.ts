@@ -281,9 +281,51 @@ async function httpGet(raw: string, deadline: number, hops = 0): Promise<{ body:
   return { body: result.body, httpStatus: result.status };
 }
 
-function gatewayBase(): string {
-  const gateway = envString("IPFS_GATEWAY");
-  return gateway.endsWith("/") ? gateway : `${gateway}/`;
+/** IPFS_GATEWAY may list several gateways, comma-separated. */
+function gateways(): string[] {
+  return envString("IPFS_GATEWAY")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((gateway) => (gateway.endsWith("/") ? gateway : `${gateway}/`));
+}
+
+/**
+ * The gateway for one IPFS path: always the same one for the same path, so the per-host pacing in
+ * the worker and the request agree, while different files spread across the configured gateways.
+ */
+function gatewayBase(path: string): string {
+  const list = gateways();
+  if (list.length === 0) throw new Error("IPFS_GATEWAY is empty");
+  let hash = 0;
+  for (const char of path) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return list[hash % list.length] as string;
+}
+
+/** Path part of an IPFS URI or public-gateway URL, or null when the URI is neither. */
+function ipfsPath(uri: string): string | null {
+  if (uri.startsWith("ipfs://")) {
+    const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
+    if (!path) throw new Error("unsupported uri scheme");
+    return path;
+  }
+  const match = uri.match(PUBLIC_IPFS_GATEWAY);
+  return match?.[1] ?? null;
+}
+
+/**
+ * The host a fetch of `uri` actually talks to: the chosen gateway for IPFS, the URL's host for
+ * http(s), "data:" for inline files, "invalid" for anything else. The worker paces fetches by this.
+ */
+export function fetchHost(uri: string): string {
+  if (uri.startsWith("data:")) return "data:";
+  try {
+    const path = ipfsPath(uri);
+    if (path != null) return new URL(gatewayBase(path)).host;
+    return new URL(uri).host;
+  } catch {
+    return "invalid";
+  }
 }
 
 /**
@@ -292,7 +334,7 @@ function gatewayBase(): string {
  * cannot steer the request elsewhere on the gateway host.
  */
 function onGateway(path: string): string {
-  const base = new URL(gatewayBase());
+  const base = new URL(gatewayBase(path));
   let target: URL;
   try {
     target = new URL(path, base);
@@ -306,14 +348,8 @@ function onGateway(path: string): string {
 }
 
 function gatewayFor(uri: string): string | null {
-  if (uri.startsWith("ipfs://")) {
-    const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
-    if (!path) throw new Error("unsupported uri scheme");
-    return onGateway(path);
-  }
-  const match = uri.match(PUBLIC_IPFS_GATEWAY);
-  if (!match?.[1]) return null;
-  return onGateway(match[1]);
+  const path = ipfsPath(uri);
+  return path == null ? null : onGateway(path);
 }
 
 export async function resolveUri(uri: string): Promise<FetchResult> {

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
-import { envInt, envString, getPool, log } from "@merces/shared";
-import { isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, type ParsedRegistration } from "./fetchUri.js";
+import { envInt, getPool, log } from "@merces/shared";
+import { fetchHost, isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, type ParsedRegistration } from "./fetchUri.js";
 
 type AgentTarget = {
   chain_id: number;
@@ -143,6 +143,9 @@ type HostStats = {
   concurrency: number;
   /** Seconds one fetch takes on this host, averaged over the last pass that used it. */
   latency: number | null;
+  /** Set while the host is left alone after answering mostly 429, 503, or timeouts. */
+  pausedUntil: number;
+  pauses: number;
   lastPass: { done: number; throttled: number; latency: number } | null;
 };
 
@@ -157,20 +160,13 @@ const hostSlots = new Map<string, { active: number; waiting: (() => void)[] }>()
 function hostStats(host: string): HostStats {
   let stats = hosts.get(host);
   if (!stats) {
-    stats = { concurrency: Math.max(1, Math.min(4, budget().perHost)), latency: null, lastPass: null };
+    stats = { concurrency: Math.max(1, Math.min(4, budget().perHost)), latency: null, pausedUntil: 0, pauses: 0, lastPass: null };
     hosts.set(host, stats);
   }
   return stats;
 }
 
-function hostOf(uri: string): string {
-  if (uri.startsWith("data:")) return "data:";
-  try {
-    return new URL(uri.startsWith("ipfs://") ? envString("IPFS_GATEWAY") : uri).host;
-  } catch {
-    return "invalid";
-  }
-}
+const hostOf = fetchHost;
 
 async function withHostSlot<T>(host: string, fn: () => Promise<T>): Promise<T> {
   if (host === "data:" || host === "invalid") return fn();
@@ -193,6 +189,7 @@ function hostShare(host: string): number {
   if (host === "data:" || host === "invalid") return Number.POSITIVE_INFINITY;
   const target = envInt("ENRICH_PASS_TARGET_SEC", 60);
   const stats = hostStats(host);
+  if (stats.pausedUntil > Date.now()) return 0;
   // An unmeasured host gets a modest first share; its latency is known after one pass.
   const rate = hostRate(stats) ?? 1;
   return Math.max(10, Math.round(rate * target));
@@ -213,16 +210,34 @@ function learnHosts(seen: Map<string, Seen>): void {
     stats.lastPass = { done: s.done, throttled: s.throttled, latency: Math.round(latency * 100) / 100 };
     if (attempts >= 5) stats.latency = latency;
     const throttleRatio = s.throttled / Math.max(1, attempts);
-    if (attempts >= 10 && throttleRatio > 0.2) stats.concurrency = Math.max(1, Math.floor(stats.concurrency / 2));
-    else if (s.throttled === 0 && stats.concurrency < max) stats.concurrency += 1;
+    if (attempts >= 10 && throttleRatio >= 0.5) {
+      // The host is refusing us. Leave it alone for a while, longer each time it happens in a row.
+      stats.concurrency = 1;
+      stats.pauses = Math.min(stats.pauses + 1, 6);
+      stats.pausedUntil = Date.now() + 5 * 60_000 * 2 ** (stats.pauses - 1);
+      log("warn", "host is throttling; pausing it", { host, minutes: 5 * 2 ** (stats.pauses - 1), throttled: s.throttled, done: s.done });
+    } else if (attempts >= 10 && throttleRatio > 0.2) {
+      stats.concurrency = Math.max(1, Math.floor(stats.concurrency / 2));
+    } else if (s.throttled === 0) {
+      stats.pauses = 0;
+      if (stats.concurrency < max) stats.concurrency += 1;
+    }
   }
 }
 
-export function hostReport(): Record<string, { concurrency: number; perSec: number | null; lastPass: HostStats["lastPass"] }> {
+export function hostReport(): Record<string, { concurrency: number; perSec: number | null; pausedUntil: string | null; lastPass: HostStats["lastPass"] }> {
   return Object.fromEntries(
     [...hosts.entries()].map(([host, stats]) => {
       const rate = hostRate(stats);
-      return [host, { concurrency: stats.concurrency, perSec: rate == null ? null : Math.round(rate * 10) / 10, lastPass: stats.lastPass }];
+      return [
+        host,
+        {
+          concurrency: stats.concurrency,
+          perSec: rate == null ? null : Math.round(rate * 10) / 10,
+          pausedUntil: stats.pausedUntil > Date.now() ? new Date(stats.pausedUntil).toISOString() : null,
+          lastPass: stats.lastPass,
+        },
+      ];
     }),
   );
 }
@@ -423,7 +438,8 @@ async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "e
   const result = await withHostSlot(hostOf(uri), () => resolveUri(uri));
   let outcome: "ok" | "error" | "throttled" = result.ok ? "ok" : THROTTLE_ERRORS.has(result.error) ? "throttled" : "error";
   for (const agent of agents) {
-    const attempts = result.ok ? 0 : agent.attempts + 1;
+    // A 429, 503, or timeout says nothing about the file; it stays on the first retry step.
+    const attempts = result.ok ? 0 : outcome === "throttled" ? Math.max(agent.attempts, 1) : agent.attempts + 1;
     try {
       await writeResult(agent, result, attempts);
     } catch (error) {
