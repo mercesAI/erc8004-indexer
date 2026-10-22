@@ -66,9 +66,10 @@ async function isPaused(): Promise<boolean> {
  *    see again. That keeps a pass to a few index lookups instead of a scan of every agent.
  * $2 terminal errors: final for the URI they were recorded against. A new on-chain URI is tried again.
  * $3 data: URIs per chain (decoded locally, no network). $4 network fetches per chain. $5 overall limit.
- * $6 hard cap on one host's rows per chain. $7 learned share per host, JSON {host: rows}; a paused host
- *    has 0 and selects nothing. $8 share of a host not seen yet. $9 the IPFS test: every IPFS URI counts
- *    under the host 'ipfs', whose share is the sum of the gateways' shares.
+ * $6 hard cap on one host's rows per chain. $7 learned share per host, JSON {host: rows}. $8 share of a
+ *    host not seen yet. $9 the IPFS test: every IPFS URI counts under the host 'ipfs', whose share is the
+ *    sum of the gateways' shares. $10 first-fetch delays, JSON {host: seconds}: a never-fetched agent
+ *    younger than its host's delay ranks last, so it takes a slot only when nothing else is due there.
  */
 const DUE_SET = `
   WITH candidates AS (
@@ -96,12 +97,16 @@ const DUE_SET = `
              WHEN r.fetch_status = 'error' AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri THEN 0
              WHEN r.agent_id IS NOT NULL AND r.agent_uri IS DISTINCT FROM a.agent_uri THEN 1
              WHEN r.fetch_status = 'ok' THEN 3
+             WHEN r.agent_id IS NULL AND d.seconds IS NOT NULL AND a.registered_at IS NOT NULL
+                  AND a.registered_at > extract(epoch from now())::numeric - d.seconds::int THEN 4
              ELSE 2
            END AS priority
     FROM candidates c
     JOIN erc8004.agents a ON a.chain_id = c.chain_id AND a.agent_id = c.agent_id
     LEFT JOIN enrich.registration_files r
       ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id
+    LEFT JOIN jsonb_each_text($10::jsonb) AS d(host, seconds)
+      ON d.host = lower(substring(a.agent_uri from '^https?://([^/]+)'))
     WHERE a.agent_uri <> ''
       AND (
         r.agent_id IS NULL
@@ -146,7 +151,7 @@ const DUE_AGENTS = `${DUE_SET},
 `;
 
 /** How many agents are due, for a pass that selected none: every host with work may be paused. */
-const DUE_COUNT = `${DUE_SET.replace("$9", "$3")}
+const DUE_COUNT = `${DUE_SET.replace("$10", "$4").replace("$9", "$3")}
   SELECT count(*)::text AS n, count(*) FILTER (WHERE fresh)::text AS fresh FROM due
 `;
 
@@ -585,10 +590,11 @@ async function selectAgents(since: Date): Promise<Selection> {
     JSON.stringify(hostShares()),
     firstShare(),
     IPFS_URI_SQL_PATTERN,
+    JSON.stringify(fetchDelays()),
   ]);
   if (result.rows.length === 0) {
     // Nothing selected does not mean nothing due: a paused host's rows are left out. Count them.
-    const count = await getPool().query<{ n: string; fresh: string }>(DUE_COUNT, [since, [...TERMINAL_FETCH_ERRORS], IPFS_URI_SQL_PATTERN]);
+    const count = await getPool().query<{ n: string; fresh: string }>(DUE_COUNT, [since, [...TERMINAL_FETCH_ERRORS], IPFS_URI_SQL_PATTERN, JSON.stringify(fetchDelays())]);
     return { agents: [], queueDepth: Number(count.rows[0]?.n ?? 0), freshDepth: Number(count.rows[0]?.fresh ?? 0) };
   }
   const first = result.rows[0] as AgentTarget & { queue_depth: string; fresh_depth: string };
