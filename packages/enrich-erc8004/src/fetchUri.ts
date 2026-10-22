@@ -3,10 +3,15 @@ import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { BlockList, isIP } from "node:net";
-import { envInt, envString } from "@merces/shared";
+import { envInt, envList } from "@merces/shared";
 
 const FETCH_USER_AGENT = "merces-indexer/1.0";
-const PUBLIC_IPFS_GATEWAY = /^https?:\/\/(?:ipfs\.io|dweb\.link|gateway\.pinata\.cloud|cloudflare-ipfs\.com|nftstorage\.link|w3s\.link|4everland\.io)\/ipfs\/(.+)$/i;
+/** Public gateways whose URLs are read as IPFS paths and fetched through IPFS_GATEWAY instead. */
+const PUBLIC_IPFS_GATEWAY_HOSTS = ["ipfs.io", "dweb.link", "gateway.pinata.cloud", "cloudflare-ipfs.com", "nftstorage.link", "w3s.link", "4everland.io"];
+const GATEWAY_HOSTS_PATTERN = PUBLIC_IPFS_GATEWAY_HOSTS.map((host) => host.replaceAll(".", "\\.")).join("|");
+const PUBLIC_IPFS_GATEWAY = new RegExp(`^https?://(?:${GATEWAY_HOSTS_PATTERN})/ipfs/(.+)$`, "i");
+/** The same test for Postgres (`~*`): true for every URI that is fetched through a gateway. */
+export const IPFS_URI_SQL_PATTERN = `^(ipfs://|https?://(${GATEWAY_HOSTS_PATTERN})/ipfs/)`;
 
 const MAX_BYTES = 256 * 1024;
 
@@ -281,29 +286,13 @@ async function httpGet(raw: string, deadline: number, hops = 0): Promise<{ body:
   return { body: result.body, httpStatus: result.status };
 }
 
-/** IPFS_GATEWAY may list several gateways, comma-separated. */
-function gateways(): string[] {
-  return envString("IPFS_GATEWAY")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((gateway) => (gateway.endsWith("/") ? gateway : `${gateway}/`));
-}
-
-/**
- * The gateway for one IPFS path: always the same one for the same path, so the per-host pacing in
- * the worker and the request agree, while different files spread across the configured gateways.
- */
-function gatewayBase(path: string): string {
-  const list = gateways();
-  if (list.length === 0) throw new Error("IPFS_GATEWAY is empty");
-  let hash = 0;
-  for (const char of path) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  return list[hash % list.length] as string;
+/** The gateways in IPFS_GATEWAY, comma-separated, each ending in a slash. */
+export function gateways(): string[] {
+  return envList("IPFS_GATEWAY").map((gateway) => (gateway.endsWith("/") ? gateway : `${gateway}/`));
 }
 
 /** Path part of an IPFS URI or public-gateway URL, or null when the URI is neither. */
-function ipfsPath(uri: string): string | null {
+export function ipfsPath(uri: string): string | null {
   if (uri.startsWith("ipfs://")) {
     const path = uri.slice("ipfs://".length).replace(/^ipfs\//, "");
     if (!path) throw new Error("unsupported uri scheme");
@@ -314,27 +303,12 @@ function ipfsPath(uri: string): string | null {
 }
 
 /**
- * The host a fetch of `uri` actually talks to: the chosen gateway for IPFS, the URL's host for
- * http(s), "data:" for inline files, "invalid" for anything else. The worker paces fetches by this.
+ * The URL for an IPFS path on `gateway`. The path is resolved against the gateway the way a browser
+ * would, then required to still sit under the gateway's own path, so `..`, `%2e%2e`, or an absolute
+ * path cannot steer the request elsewhere on the gateway host.
  */
-export function fetchHost(uri: string): string {
-  if (uri.startsWith("data:")) return "data:";
-  try {
-    const path = ipfsPath(uri);
-    if (path != null) return new URL(gatewayBase(path)).host;
-    return new URL(uri).host;
-  } catch {
-    return "invalid";
-  }
-}
-
-/**
- * The gateway URL for an IPFS path. The path is resolved against the gateway the way a browser would,
- * then required to still sit under the gateway's own path, so `..`, `%2e%2e`, or an absolute path
- * cannot steer the request elsewhere on the gateway host.
- */
-function onGateway(path: string): string {
-  const base = new URL(gatewayBase(path));
+function onGateway(gateway: string, path: string): string {
+  const base = new URL(gateway);
   let target: URL;
   try {
     target = new URL(path, base);
@@ -347,18 +321,19 @@ function onGateway(path: string): string {
   return target.href;
 }
 
-function gatewayFor(uri: string): string | null {
-  const path = ipfsPath(uri);
-  return path == null ? null : onGateway(path);
-}
-
-export async function resolveUri(uri: string): Promise<FetchResult> {
+/**
+ * Fetch and parse one registration file. An IPFS path is fetched from `gateway`, one of `gateways()`,
+ * or from the first configured gateway when the caller does not choose.
+ */
+export async function resolveUri(uri: string, gateway?: string): Promise<FetchResult> {
   try {
     let body: string;
     let httpStatus: number | null = null;
-    const rewritten = gatewayFor(uri);
-    if (rewritten) {
-      const fetched = await httpGet(rewritten, fetchDeadline());
+    const path = ipfsPath(uri);
+    if (path != null) {
+      const base = gateway ?? gateways()[0];
+      if (!base) throw new Error("IPFS_GATEWAY is empty");
+      const fetched = await httpGet(onGateway(base, path), fetchDeadline());
       body = fetched.body;
       httpStatus = fetched.httpStatus;
     } else if (uri.startsWith("https://") || uri.startsWith("http://")) {
@@ -397,6 +372,8 @@ export async function resolveUri(uri: string): Promise<FetchResult> {
 }
 
 export const RETRY_MS = [60 * 60 * 1000, 6 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000];
+/** A 429, 503, or timeout says nothing about the file; it is tried again soon, whatever its step. */
+export const THROTTLE_RETRY_MS = 15 * 60 * 1000;
 
 export const TERMINAL_FETCH_ERRORS = [
   "unsupported uri scheme",

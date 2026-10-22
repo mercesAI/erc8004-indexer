@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { envInt, getPool, log } from "@merces/shared";
-import { fetchHost, isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, type ParsedRegistration } from "./fetchUri.js";
+import { gateways, ipfsPath, IPFS_URI_SQL_PATTERN, isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, THROTTLE_RETRY_MS, type ParsedRegistration } from "./fetchUri.js";
 
 type AgentTarget = {
   chain_id: number;
@@ -47,12 +47,16 @@ async function isPaused(): Promise<boolean> {
 }
 
 /**
- * Agents that need a fetch, in priority order, limited per chain so one chain cannot starve the
- * others: up to 200 data: URIs (decoded locally, no network) and up to 40 network fetches each.
+ * Agents that need a fetch, sized per host so a pass takes about what each host can answer in one
+ * target window, and no platform starves another.
  *
  * $1 watermark: only agents the indexer wrote after this time are considered, plus every file whose
  *    retry is due. That keeps a pass to a few index lookups instead of a scan of every agent.
  * $2 terminal errors: final for the URI they were recorded against. A new on-chain URI is tried again.
+ * $3 data: URIs per chain (decoded locally, no network). $4 network fetches per chain. $5 overall limit.
+ * $6 hard cap on one host's rows per chain. $7 learned share per host, JSON {host: rows}; a paused host
+ *    has 0 and selects nothing. $8 share of a host not seen yet. $9 the IPFS test: every IPFS URI counts
+ *    under the host 'ipfs', whose share is the sum of the gateways' shares.
  */
 const DUE_AGENTS = `
   WITH candidates AS (
@@ -66,6 +70,10 @@ const DUE_AGENTS = `
            a.agent_id::text AS agent_id,
            a.agent_uri,
            a.registered_at,
+           CASE
+             WHEN a.agent_uri ~* $9 THEN 'ipfs'
+             ELSE lower(substring(a.agent_uri from '^https?://([^/]+)'))
+           END AS host,
            CASE
              WHEN r.agent_id IS NULL OR r.agent_uri IS DISTINCT FROM a.agent_uri THEN 0
              ELSE COALESCE(r.attempts, 0)
@@ -92,35 +100,37 @@ const DUE_AGENTS = `
     -- the newest rows, which would all belong to whichever platform registered most recently.
     SELECT due.*,
            row_number() OVER (
-             PARTITION BY chain_id, substring(agent_uri from '^https?://([^/]+)')
+             PARTITION BY chain_id, host
              ORDER BY priority, registered_at DESC NULLS LAST
            ) AS host_rn,
            count(*) OVER () AS queue_depth
     FROM due
   ),
   ranked AS (
-    SELECT *,
+    -- Each host contributes what it can answer this pass. data: URIs cost no network and are not sized.
+    SELECT b.*,
            row_number() OVER (
-             PARTITION BY chain_id, (agent_uri LIKE 'data:%')
-             ORDER BY host_rn, priority, registered_at DESC NULLS LAST
+             PARTITION BY b.chain_id, (b.agent_uri LIKE 'data:%')
+             ORDER BY b.host_rn, b.priority, b.registered_at DESC NULLS LAST
            ) AS rn
-    FROM by_host
-    WHERE host_rn <= $6
+    FROM by_host b
+    LEFT JOIN jsonb_each_text($7::jsonb) AS share(host, n) ON share.host = b.host
+    WHERE b.agent_uri LIKE 'data:%' OR b.host_rn <= LEAST($6::int, COALESCE(share.n::int, $8::int))
   )
   SELECT chain_id, agent_id, agent_uri, attempts, queue_depth::text AS queue_depth
   FROM ranked
   WHERE (agent_uri LIKE 'data:%' AND rn <= $3)
      OR (agent_uri NOT LIKE 'data:%' AND rn <= $4)
-  -- rn first, so the overall limit also interleaves chains rather than favouring the newest one.
-  ORDER BY (agent_uri LIKE 'data:%') DESC, priority, rn
+  -- rn first, so the overall limit interleaves chains and hosts instead of taking one host's retries first.
+  ORDER BY (agent_uri LIKE 'data:%') DESC, rn, priority
   LIMIT $5
 `;
 
 /**
  * Per-pass budget. The SQL caps are upper bounds on what a pass may look at; each host's real
  * share and concurrency are learned (see hostShare and learnHosts). The defaults are gentle; a
- * server with a backlog runs with ENRICH_NETWORK_PER_CHAIN=3000 ENRICH_NETWORK_PER_HOST=3000
- * ENRICH_DATA_PER_CHAIN=3000 ENRICH_PASS_LIMIT=12000 ENRICH_CONCURRENCY=24 ENRICH_PER_HOST_CONCURRENCY=8.
+ * server with a backlog runs with ENRICH_NETWORK_PER_CHAIN=12000 ENRICH_NETWORK_PER_HOST=12000
+ * ENRICH_DATA_PER_CHAIN=3000 ENRICH_PASS_LIMIT=12000 ENRICH_CONCURRENCY=64 ENRICH_PER_HOST_CONCURRENCY=16.
  */
 function budget() {
   return {
@@ -135,9 +145,11 @@ function budget() {
 
 /**
  * Every host gets its own concurrency and its own share of a pass, both learned from how it
- * answered last time. A host that returns 429s or times out loses concurrency; a clean host gains
- * it, up to ENRICH_PER_HOST_CONCURRENCY. A pass gives each host about ENRICH_PASS_TARGET_SEC worth
- * of work at its measured rate, so a slow platform never holds the others back.
+ * answered last time. A host that returns 429s or times out loses concurrency, and one that mostly
+ * refuses is paused for a while; a clean host gains concurrency, up to ENRICH_PER_HOST_CONCURRENCY.
+ * A pass gives each host about ENRICH_PASS_TARGET_SEC worth of work at its measured rate, so a slow
+ * platform never holds the others back. IPFS files are spread over the configured gateways the same
+ * way: each is a host of its own, and a file goes to the gateway with the most of its share left.
  */
 type HostStats = {
   concurrency: number;
@@ -166,8 +178,6 @@ function hostStats(host: string): HostStats {
   return stats;
 }
 
-const hostOf = fetchHost;
-
 async function withHostSlot<T>(host: string, fn: () => Promise<T>): Promise<T> {
   if (host === "data:" || host === "invalid") return fn();
   const slot = hostSlots.get(host) ?? { active: 0, waiting: [] };
@@ -184,19 +194,76 @@ async function withHostSlot<T>(host: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/** Rows a host gets before its pace is known. */
+function firstShare(): number {
+  return Math.max(10, envInt("ENRICH_PASS_TARGET_SEC", 60));
+}
+
 /** How many URI groups of `host` this pass takes: about one target window at the measured rate. */
 function hostShare(host: string): number {
   if (host === "data:" || host === "invalid") return Number.POSITIVE_INFINITY;
-  const target = envInt("ENRICH_PASS_TARGET_SEC", 60);
   const stats = hostStats(host);
   if (stats.pausedUntil > Date.now()) return 0;
-  // An unmeasured host gets a modest first share; its latency is known after one pass.
-  const rate = hostRate(stats) ?? 1;
-  return Math.max(10, Math.round(rate * target));
+  const rate = hostRate(stats);
+  if (rate == null) return firstShare();
+  return Math.max(10, Math.round(rate * envInt("ENRICH_PASS_TARGET_SEC", 60)));
+}
+
+/** The share of every host seen so far, for the selection. IPFS files count under 'ipfs', the gateways' total. */
+function hostShares(): Record<string, number> {
+  const gatewayHosts = new Set(gateways().map((gateway) => new URL(gateway).host));
+  const shares: Record<string, number> = { ipfs: 0 };
+  for (const host of gatewayHosts) shares.ipfs += hostShare(host);
+  for (const host of hosts.keys()) {
+    if (host === "data:" || host === "invalid" || gatewayHosts.has(host)) continue;
+    shares[host] = hostShare(host);
+  }
+  return shares;
+}
+
+type Plan = { host: string; gateway?: string };
+
+/**
+ * Where a fetch of `uri` goes: for an IPFS file the gateway with the most of its share still free,
+ * for http(s) the URL's host, "data:" for an inline file, "invalid" for anything else. `assigned`
+ * counts the IPFS files already given to each gateway this pass.
+ */
+function planFetch(uri: string, assigned: Map<string, number>): Plan {
+  if (uri.startsWith("data:")) return { host: "data:" };
+  try {
+    const path = ipfsPath(uri);
+    if (path == null) return { host: new URL(uri).host };
+    const gateway = pickGateway(assigned);
+    return gateway ? { host: new URL(gateway).host, gateway } : { host: "invalid" };
+  } catch {
+    return { host: "invalid" };
+  }
+}
+
+function pickGateway(assigned: Map<string, number>): string | null {
+  const list = gateways();
+  const live = list.filter((gateway) => hostShare(new URL(gateway).host) > 0);
+  if (live.length === 0) {
+    // Every gateway is paused. Name the one that resumes first; its share of 0 leaves the file due.
+    return list.sort((a, b) => hostStats(new URL(a).host).pausedUntil - hostStats(new URL(b).host).pausedUntil)[0] ?? null;
+  }
+  let best = live[0] as string;
+  let bestFree = Number.NEGATIVE_INFINITY;
+  for (const gateway of live) {
+    const share = hostShare(new URL(gateway).host);
+    const free = (share - (assigned.get(gateway) ?? 0)) / share;
+    if (free > bestFree) {
+      best = gateway;
+      bestFree = free;
+    }
+  }
+  assigned.set(best, (assigned.get(best) ?? 0) + 1);
+  return best;
 }
 
 const THROTTLE_ERRORS = new Set(["HTTP 429", "HTTP 503", "timeout"]);
 
+/** One pass on one host: answered fetches, refusals, and the time the answered ones took. */
 type Seen = { done: number; throttled: number; busyMs: number };
 
 /** After a pass: record each host's latency, and move its concurrency toward what it tolerates. */
@@ -206,9 +273,10 @@ function learnHosts(seen: Map<string, Seen>): void {
     if (host === "data:" || host === "invalid") continue;
     const stats = hostStats(host);
     const attempts = s.done + s.throttled;
-    const latency = attempts > 0 ? s.busyMs / attempts / 1000 : stats.latency ?? 1;
+    // Latency comes from answered fetches only: a refusal arrives in milliseconds and says nothing about pace.
+    const latency = s.done > 0 ? s.busyMs / s.done / 1000 : stats.latency ?? 1;
     stats.lastPass = { done: s.done, throttled: s.throttled, latency: Math.round(latency * 100) / 100 };
-    if (attempts >= 5) stats.latency = latency;
+    if (s.done >= 5) stats.latency = latency;
     const throttleRatio = s.throttled / Math.max(1, attempts);
     if (attempts >= 10 && throttleRatio >= 0.5) {
       // The host is refusing us. Leave it alone for a while, longer each time it happens in a row.
@@ -242,7 +310,7 @@ export function hostReport(): Record<string, { concurrency: number; perSec: numb
   );
 }
 
-type Work = [string, AgentTarget[]];
+type Work = { uri: string; agents: AgentTarget[]; host: string; gateway?: string };
 
 /**
  * Run a pass: `concurrency` workers pick the next URI from any host that still has a free slot,
@@ -257,10 +325,9 @@ async function runWork(
 ): Promise<number> {
   const queues = new Map<string, Work[]>();
   for (const entry of work) {
-    const host = hostOf(entry[0]);
-    const queue = queues.get(host) ?? [];
+    const queue = queues.get(entry.host) ?? [];
     queue.push(entry);
-    queues.set(host, queue);
+    queues.set(entry.host, queue);
   }
   const order = [...queues.keys()];
   const active = new Map<string, number>();
@@ -285,7 +352,7 @@ async function runWork(
   };
   const remaining = () => {
     let n = 0;
-    for (const queue of queues.values()) for (const entry of queue) n += entry[1].length;
+    for (const queue of queues.values()) for (const entry of queue) n += entry.agents.length;
     return n;
   };
   let picks = 0;
@@ -302,14 +369,13 @@ async function runWork(
       }
       picks += 1;
       if (picks % 20 === 0 && (await isPaused())) return;
-      const host = hostOf(next[0]);
-      active.set(host, (active.get(host) ?? 0) + 1);
+      active.set(next.host, (active.get(next.host) ?? 0) + 1);
       const begun = Date.now();
       try {
-        const outcome = await fetchGroup(next[0], next[1]);
-        onDone(host, outcome, Date.now() - begun, next[1].length);
+        const outcome = await fetchGroup(next);
+        onDone(next.host, outcome, Date.now() - begun, next.agents.length);
       } finally {
-        active.set(host, (active.get(host) ?? 0) - 1);
+        active.set(next.host, (active.get(next.host) ?? 0) - 1);
         wake();
       }
     }
@@ -320,7 +386,7 @@ async function runWork(
   return remaining();
 }
 
-async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number): Promise<void> {
+async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number, throttled = false): Promise<void> {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
@@ -377,7 +443,7 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
       }
     } else {
       const terminal = isTerminalFetchError(result.error);
-      const delay = terminal ? null : (RETRY_MS[Math.min(Math.max(attempts, 1) - 1, RETRY_MS.length - 1)] ?? RETRY_MS[3]);
+      const delay = terminal ? null : throttled ? THROTTLE_RETRY_MS : (RETRY_MS[Math.min(Math.max(attempts, 1) - 1, RETRY_MS.length - 1)] ?? RETRY_MS[3]);
       // The services of a previous good fetch stay while the URI is unchanged. A new URI that fails drops them.
       await client.query(
         `DELETE FROM enrich.agent_services
@@ -434,14 +500,14 @@ function isUnstorable(error: unknown): boolean {
   return typeof code === "string" && (code.startsWith("22") || code.startsWith("54"));
 }
 
-async function fetchGroup(uri: string, agents: AgentTarget[]): Promise<"ok" | "error" | "throttled"> {
-  const result = await withHostSlot(hostOf(uri), () => resolveUri(uri));
+async function fetchGroup({ uri, agents, host, gateway }: Work): Promise<"ok" | "error" | "throttled"> {
+  const result = await withHostSlot(host, () => resolveUri(uri, gateway));
   let outcome: "ok" | "error" | "throttled" = result.ok ? "ok" : THROTTLE_ERRORS.has(result.error) ? "throttled" : "error";
   for (const agent of agents) {
-    // A 429, 503, or timeout says nothing about the file; it stays on the first retry step.
-    const attempts = result.ok ? 0 : outcome === "throttled" ? Math.max(agent.attempts, 1) : agent.attempts + 1;
+    // A refusal says nothing about the file: it goes back to the first step and is retried soon.
+    const attempts = result.ok ? 0 : outcome === "throttled" ? 1 : agent.attempts + 1;
     try {
-      await writeResult(agent, result, attempts);
+      await writeResult(agent, result, attempts, outcome === "throttled");
     } catch (error) {
       if (!isUnstorable(error)) throw error;
       outcome = "error";
@@ -462,6 +528,9 @@ async function selectAgents(since: Date): Promise<Selection> {
     b.networkPerChain,
     b.passLimit,
     b.networkPerHost,
+    JSON.stringify(hostShares()),
+    firstShare(),
+    IPFS_URI_SQL_PATTERN,
   ]);
   const queueDepth = Number(result.rows[0]?.queue_depth ?? 0);
   return { agents: result.rows.map(({ queue_depth: _depth, ...agent }) => agent), queueDepth };
@@ -477,18 +546,19 @@ async function runPass(): Promise<PassStats> {
     group.push(agent);
     byUri.set(agent.agent_uri, group);
   }
-  // Each host gets about one target window of work at its measured rate; the rest stays due.
+  // The selection is already sized per host; this trims a host whose share shrank since it ran.
   const taken = new Map<string, number>();
-  const work: [string, AgentTarget[]][] = [];
+  const assigned = new Map<string, number>();
+  const work: Work[] = [];
   let left = 0;
-  for (const entry of byUri) {
-    const host = hostOf(entry[0]);
-    const n = taken.get(host) ?? 0;
-    if (n < hostShare(host)) {
-      taken.set(host, n + 1);
-      work.push(entry);
+  for (const [uri, group] of byUri) {
+    const plan = planFetch(uri, assigned);
+    const n = taken.get(plan.host) ?? 0;
+    if (n < hostShare(plan.host)) {
+      taken.set(plan.host, n + 1);
+      work.push({ uri, agents: group, ...plan });
     } else {
-      left += entry[1].length;
+      left += group.length;
     }
   }
   let fetched = 0;
@@ -497,20 +567,22 @@ async function runPass(): Promise<PassStats> {
   const deadline = started + envInt("ENRICH_PASS_TARGET_SEC", 60) * 1000;
   const notStarted = await runWork(work, budget().concurrency, deadline, (host, outcome, ms, agents) => {
     const s = seen.get(host) ?? { done: 0, throttled: 0, busyMs: 0 };
-    if (outcome === "throttled") s.throttled += 1;
-    else s.done += 1;
-    s.busyMs += ms;
+    if (outcome === "throttled") {
+      s.throttled += 1;
+    } else {
+      s.done += 1;
+      s.busyMs += ms;
+    }
     seen.set(host, s);
     if (outcome === "ok") fetched += agents;
     else failed += agents;
   });
   left += notStarted;
   const selected = agents.length - left;
-  const skipped = 0;
   learnHosts(seen);
   // Everything due was taken and written: later passes only need what the indexer writes from here on.
   // Otherwise the backlog is re-scanned next pass, which is the full scan until it drains.
-  if (skipped === 0 && left === 0 && queueDepth <= agents.length) state.watermark = new Date(started - WATERMARK_LAG_MS);
+  if (left === 0 && queueDepth <= agents.length) state.watermark = new Date(started - WATERMARK_LAG_MS);
   return {
     at: new Date().toISOString(),
     selected,
@@ -570,7 +642,7 @@ async function runJobs(): Promise<void> {
         await finishJob(job.id, "failed", "agent not found or uri empty");
         continue;
       }
-      const outcome = await fetchGroup(agent.agent_uri, [agent]);
+      const outcome = await fetchGroup({ uri: agent.agent_uri, agents: [agent], ...planFetch(agent.agent_uri, new Map()) });
       await finishJob(job.id, outcome === "ok" ? "done" : "failed", outcome === "ok" ? null : "fetch failed");
     } catch (error) {
       await finishJob(job.id, "failed", error instanceof Error ? error.message : String(error));
