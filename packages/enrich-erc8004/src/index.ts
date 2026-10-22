@@ -238,14 +238,21 @@ function hostShare(host: string): number {
   return Math.max(10, Math.round(rate * envInt("ENRICH_PASS_TARGET_SEC", 60)));
 }
 
-/** The share of every host seen so far, for the selection. IPFS files count under 'ipfs', the gateways' total. */
+/** Rows a paused host still gets per pass, so its agents can be parked and stop counting as due. */
+const PARK_SHARE = 10;
+
+/**
+ * The share of every host seen so far, for the selection. IPFS files count under 'ipfs', the gateways'
+ * total. A paused host keeps a few rows: the pass parks them (see parkAgents) instead of fetching.
+ */
 function hostShares(): Record<string, number> {
   const gatewayHosts = new Set(gateways().map((gateway) => new URL(gateway).host));
   const shares: Record<string, number> = { ipfs: 0 };
   for (const host of gatewayHosts) shares.ipfs += hostShare(host);
+  shares.ipfs = Math.max(shares.ipfs, PARK_SHARE);
   for (const host of hosts.keys()) {
     if (host === "data:" || host === "invalid" || gatewayHosts.has(host)) continue;
-    shares[host] = hostShare(host);
+    shares[host] = Math.max(hostShare(host), PARK_SHARE);
   }
   return shares;
 }
