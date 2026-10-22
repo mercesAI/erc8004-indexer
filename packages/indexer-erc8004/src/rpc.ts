@@ -98,10 +98,12 @@ export async function blockNumber(url: string, counters: ChainCounters): Promise
 const SHRINK_MESSAGE = /too (big|many|large)|response size|block range|limited to .*range|returned more than|exceed(s|ed)? (the )?(max(imum)? )?(limit|size)|10,?000 (logs|results)/i;
 const TIMEOUT_MESSAGE = /timeout|timed out|aborted/i;
 const QUOTA_MESSAGE = /capacity|compute unit|rate ?limit|per second|throughput|quota|billing/i;
+// "block range extends beyond current head block": asking for fewer blocks does not help either.
+const HEAD_MESSAGE = /beyond (the )?(current )?head|past (the )?head|after (the )?latest block/i;
 
 export function shouldShrinkRange(error: unknown): boolean {
   if (!(error instanceof RpcError) || error.httpStatus === 429) return false;
-  if (QUOTA_MESSAGE.test(error.message)) return false;
+  if (QUOTA_MESSAGE.test(error.message) || HEAD_MESSAGE.test(error.message)) return false;
   if (error.code === -32008 || error.code === -32005) return true;
   return SHRINK_MESSAGE.test(error.message);
 }
