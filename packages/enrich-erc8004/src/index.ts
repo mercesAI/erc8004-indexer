@@ -679,8 +679,10 @@ async function runPass(): Promise<PassStats> {
 }
 
 /**
- * Agents whose host is paused: a never-fetched agent gets a 'pending' row due when the pause ends, and
- * a row whose retry or re-fetch is due is pushed to then, so neither is selected again in the meantime.
+ * Agents whose host is paused: a never-fetched agent gets a 'pending' row due when the pause ends; a
+ * row whose retry or re-fetch is due is pushed to then; and a row for an older URI becomes a 'pending'
+ * row for the new one, with the old file's fields cleared as a failed fetch of a new URI would clear
+ * them. None of them is selected again before the pause ends.
  */
 async function parkAgents(agents: AgentTarget[], until: string[]): Promise<void> {
   if (agents.length === 0) return;
@@ -688,10 +690,25 @@ async function parkAgents(agents: AgentTarget[], until: string[]): Promise<void>
     `INSERT INTO enrich.registration_files (chain_id, agent_id, agent_uri, fetch_status, next_retry_at, attempts)
      SELECT u.chain, u.agent, u.uri, 'pending', u.until::timestamptz, 0
      FROM unnest($1::int[], $2::numeric[], $3::text[], $4::text[]) AS u(chain, agent, uri, until)
-     ON CONFLICT (chain_id, agent_id) DO UPDATE SET next_retry_at = EXCLUDED.next_retry_at
-     WHERE enrich.registration_files.next_retry_at IS NOT NULL
-       AND enrich.registration_files.next_retry_at <= now()
-       AND enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri`,
+     ON CONFLICT (chain_id, agent_id) DO UPDATE SET
+       next_retry_at = EXCLUDED.next_retry_at,
+       agent_uri = EXCLUDED.agent_uri,
+       fetch_status = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.fetch_status ELSE 'pending' END,
+       attempts = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.attempts ELSE 0 END,
+       error = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.error ELSE NULL END,
+       http_status = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.http_status ELSE NULL END,
+       raw = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.raw ELSE NULL END,
+       content_hash = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.content_hash ELSE NULL END,
+       name = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.name ELSE NULL END,
+       description = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.description ELSE NULL END,
+       image = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.image ELSE NULL END,
+       active = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.active ELSE NULL END,
+       x402_support = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.x402_support ELSE NULL END,
+       supported_trust = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.supported_trust ELSE NULL END,
+       final_host = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.final_host ELSE NULL END,
+       refetches = CASE WHEN enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri THEN enrich.registration_files.refetches ELSE 0 END
+     WHERE enrich.registration_files.agent_uri IS DISTINCT FROM EXCLUDED.agent_uri
+        OR (enrich.registration_files.next_retry_at IS NOT NULL AND enrich.registration_files.next_retry_at <= now())`,
     [agents.map((a) => a.chain_id), agents.map((a) => a.agent_id), agents.map((a) => a.agent_uri), until],
   );
 }
