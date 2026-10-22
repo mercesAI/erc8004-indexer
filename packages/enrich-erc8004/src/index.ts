@@ -704,8 +704,9 @@ async function main(): Promise<void> {
       state.lastPass = stats;
       log("info", "pass", stats);
       failures = 0;
-      // With a backlog, go straight to the next pass; otherwise look again in a minute.
-      const until = Date.now() + (stats.backlog ? 2000 : 60_000);
+      // With a backlog this pass could work on, go straight to the next pass; otherwise look again
+      // in a minute. A backlog whose every host is paused is nothing to do for now.
+      const until = Date.now() + (stats.backlog && stats.selected > 0 ? 2000 : 60_000);
       while (Date.now() < until) {
         await runJobs();
         if (await isPaused()) break;
