@@ -12,6 +12,8 @@ type AgentTarget = {
   registered_at: string | null;
   /** Whether a registration_files row exists already (fetched, failed, or pending). */
   has_file: boolean;
+  /** Never fetched, or the on-chain URI changed: due on its own account, not because a retry came up. */
+  fresh: boolean;
 };
 
 type PassStats = {
@@ -21,6 +23,8 @@ type PassStats = {
   failed: number;
   /** New agents whose publisher asks for a wait before the first fetch; they come back when due. */
   deferred: number;
+  /** Agents on a paused host, held until the pause ends. */
+  parked: number;
   durationMs: number;
   /** True when more agents were due than this pass could take; the next pass starts at once. */
   backlog: boolean;
@@ -83,6 +87,7 @@ const DUE_SET = `
              ELSE lower(substring(a.agent_uri from '^https?://([^/]+)'))
            END AS host,
            (r.agent_id IS NOT NULL) AS has_file,
+           (r.agent_id IS NULL OR r.agent_uri IS DISTINCT FROM a.agent_uri) AS fresh,
            CASE
              WHEN r.agent_id IS NULL OR r.agent_uri IS DISTINCT FROM a.agent_uri THEN 0
              ELSE COALESCE(r.attempts, 0)
@@ -115,7 +120,8 @@ const DUE_AGENTS = `${DUE_SET},
              PARTITION BY chain_id, host
              ORDER BY priority, registered_at DESC NULLS LAST
            ) AS host_rn,
-           count(*) OVER () AS queue_depth
+           count(*) OVER () AS queue_depth,
+           count(*) FILTER (WHERE fresh) OVER () AS fresh_depth
     FROM due
   ),
   ranked AS (
@@ -129,7 +135,8 @@ const DUE_AGENTS = `${DUE_SET},
     LEFT JOIN jsonb_each_text($7::jsonb) AS share(host, n) ON share.host = b.host
     WHERE b.agent_uri LIKE 'data:%' OR b.host_rn <= LEAST($6::int, COALESCE(share.n::int, $8::int))
   )
-  SELECT chain_id, agent_id, agent_uri, attempts, registered_at::text AS registered_at, has_file, queue_depth::text AS queue_depth
+  SELECT chain_id, agent_id, agent_uri, attempts, registered_at::text AS registered_at, has_file, fresh,
+         queue_depth::text AS queue_depth, fresh_depth::text AS fresh_depth
   FROM ranked
   WHERE (agent_uri LIKE 'data:%' AND rn <= $3)
      OR (agent_uri NOT LIKE 'data:%' AND rn <= $4)
@@ -140,7 +147,7 @@ const DUE_AGENTS = `${DUE_SET},
 
 /** How many agents are due, for a pass that selected none: every host with work may be paused. */
 const DUE_COUNT = `${DUE_SET.replace("$9", "$3")}
-  SELECT count(*)::text AS n FROM due
+  SELECT count(*)::text AS n, count(*) FILTER (WHERE fresh)::text AS fresh FROM due
 `;
 
 /**
@@ -172,9 +179,13 @@ type HostStats = {
   concurrency: number;
   /** Seconds one fetch takes on this host, averaged over the last pass that used it. */
   latency: number | null;
-  /** Set while the host is left alone after answering mostly 429, 503, or timeouts. */
+  /** Set while the host is left alone after refusing even one fetch at a time. */
   pausedUntil: number;
   pauses: number;
+  /** The concurrency at which the host last throttled; the climb stops one below it. */
+  ceiling: number | null;
+  /** Clean passes in a row at the current concurrency. */
+  clean: number;
   lastPass: { done: number; throttled: number; latency: number } | null;
 };
 
@@ -190,7 +201,7 @@ function hostStats(host: string): HostStats {
   let stats = hosts.get(host);
   if (!stats) {
     // Two to begin with: a platform that limits requests by the minute is found before it is flooded.
-    stats = { concurrency: Math.max(1, Math.min(2, budget().perHost)), latency: null, pausedUntil: 0, pauses: 0, lastPass: null };
+    stats = { concurrency: Math.max(1, Math.min(2, budget().perHost)), latency: null, pausedUntil: 0, pauses: 0, ceiling: null, clean: 0, lastPass: null };
     hosts.set(host, stats);
   }
   return stats;
@@ -296,22 +307,31 @@ function learnHosts(seen: Map<string, Seen>): void {
     stats.lastPass = { done: s.done, throttled: s.throttled, latency: Math.round(latency * 100) / 100 };
     if (s.done >= 5) stats.latency = latency;
     const throttleRatio = s.throttled / Math.max(1, attempts);
-    if (attempts >= 10 && throttleRatio >= 0.5) {
-      // The host is refusing us. Leave it alone for a while, longer each time it happens in a row.
-      stats.concurrency = 1;
+    if (attempts >= 10 && throttleRatio >= 0.5 && stats.concurrency <= 1) {
+      // Refused even one fetch at a time: leave the host alone, longer each time it happens in a row.
       stats.pauses = Math.min(stats.pauses + 1, 6);
       stats.pausedUntil = Date.now() + 5 * 60_000 * 2 ** (stats.pauses - 1);
+      stats.clean = 0;
       log("warn", "host is throttling; pausing it", { host, minutes: 5 * 2 ** (stats.pauses - 1), throttled: s.throttled, done: s.done });
     } else if (attempts >= 10 && throttleRatio > 0.2) {
+      // Too much for the host: remember where it broke and back off to half.
+      stats.ceiling = stats.concurrency;
       stats.concurrency = Math.max(1, Math.floor(stats.concurrency / 2));
+      stats.clean = 0;
     } else if (s.throttled === 0) {
+      // Climb one step per clean pass, up to one below where the host last broke. Every tenth clean
+      // pass at that level probes a step higher, so a limit that has moved is found again.
       stats.pauses = 0;
-      if (stats.concurrency < max) stats.concurrency += 1;
+      stats.clean += 1;
+      const limit = stats.ceiling === null ? max : Math.min(max, Math.max(1, stats.ceiling - 1));
+      if (stats.concurrency < limit) stats.concurrency += 1;
+      else if (stats.concurrency < max && stats.clean % 10 === 0) stats.concurrency += 1;
     }
+    // A little throttling, a fifth or less, keeps the concurrency where it is.
   }
 }
 
-export function hostReport(): Record<string, { concurrency: number; perSec: number | null; pausedUntil: string | null; lastPass: HostStats["lastPass"] }> {
+export function hostReport(): Record<string, { concurrency: number; ceiling: number | null; perSec: number | null; pausedUntil: string | null; lastPass: HostStats["lastPass"] }> {
   return Object.fromEntries(
     [...hosts.entries()].map(([host, stats]) => {
       const rate = hostRate(stats);
@@ -319,6 +339,7 @@ export function hostReport(): Record<string, { concurrency: number; perSec: numb
         host,
         {
           concurrency: stats.concurrency,
+          ceiling: stats.ceiling,
           perSec: rate == null ? null : Math.round(rate * 10) / 10,
           pausedUntil: stats.pausedUntil > Date.now() ? new Date(stats.pausedUntil).toISOString() : null,
           lastPass: stats.lastPass,
@@ -333,14 +354,14 @@ type Work = { uri: string; agents: AgentTarget[]; host: string; gateway?: string
 /**
  * Run a pass: `concurrency` workers pick the next URI from any host that still has a free slot,
  * so nobody queues behind one busy platform. Picking stops at `deadline`; fetches already running
- * finish, and whatever was not started stays due for the next pass. Returns what was left.
+ * finish, and whatever was not started stays due for the next pass. Returns what was not started.
  */
 async function runWork(
   work: Work[],
   concurrency: number,
   deadline: number,
   onDone: (host: string, outcome: "ok" | "error" | "throttled", ms: number, agents: number) => void,
-): Promise<number> {
+): Promise<Work[]> {
   const queues = new Map<string, Work[]>();
   for (const entry of work) {
     const queue = queues.get(entry.host) ?? [];
@@ -401,7 +422,7 @@ async function runWork(
   const results = await Promise.allSettled(Array.from({ length: Math.min(concurrency, work.length) }, worker));
   const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
   if (failed) throw failed.reason;
-  return remaining();
+  return [...queues.values()].flat();
 }
 
 async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof resolveUri>>, attempts: number, throttled = false): Promise<void> {
@@ -543,11 +564,11 @@ async function fetchGroup({ uri, agents, host, gateway }: Work): Promise<"ok" | 
   return outcome;
 }
 
-type Selection = { agents: AgentTarget[]; queueDepth: number };
+type Selection = { agents: AgentTarget[]; queueDepth: number; freshDepth: number };
 
 async function selectAgents(since: Date): Promise<Selection> {
   const b = budget();
-  const result = await getPool().query<AgentTarget & { queue_depth: string }>(DUE_AGENTS, [
+  const result = await getPool().query<AgentTarget & { queue_depth: string; fresh_depth: string }>(DUE_AGENTS, [
     since,
     [...TERMINAL_FETCH_ERRORS],
     b.dataPerChain,
@@ -560,16 +581,20 @@ async function selectAgents(since: Date): Promise<Selection> {
   ]);
   if (result.rows.length === 0) {
     // Nothing selected does not mean nothing due: a paused host's rows are left out. Count them.
-    const count = await getPool().query<{ n: string }>(DUE_COUNT, [since, [...TERMINAL_FETCH_ERRORS], IPFS_URI_SQL_PATTERN]);
-    return { agents: [], queueDepth: Number(count.rows[0]?.n ?? 0) };
+    const count = await getPool().query<{ n: string; fresh: string }>(DUE_COUNT, [since, [...TERMINAL_FETCH_ERRORS], IPFS_URI_SQL_PATTERN]);
+    return { agents: [], queueDepth: Number(count.rows[0]?.n ?? 0), freshDepth: Number(count.rows[0]?.fresh ?? 0) };
   }
-  const queueDepth = Number(result.rows[0]?.queue_depth ?? 0);
-  return { agents: result.rows.map(({ queue_depth: _depth, ...agent }) => agent), queueDepth };
+  const first = result.rows[0] as AgentTarget & { queue_depth: string; fresh_depth: string };
+  return {
+    agents: result.rows.map(({ queue_depth: _depth, fresh_depth: _fresh, ...agent }) => agent),
+    queueDepth: Number(first.queue_depth),
+    freshDepth: Number(first.fresh_depth),
+  };
 }
 
 async function runPass(): Promise<PassStats> {
   const started = Date.now();
-  const { agents, queueDepth } = await selectAgents(state.watermark);
+  const { agents, queueDepth, freshDepth } = await selectAgents(state.watermark);
   state.queueDepth = queueDepth;
   // A publisher may ask that a new agent's file is left alone for a while (publishers.yaml,
   // fetch_after_minutes): a 'pending' row holds its place and comes back through next_retry_at.
@@ -581,21 +606,34 @@ async function runPass(): Promise<PassStats> {
     group.push(agent);
     byUri.set(agent.agent_uri, group);
   }
-  // The selection is already sized per host; this trims a host whose share shrank since it ran.
+  // The selection is already sized per host; this trims a host whose share shrank since it ran. A
+  // paused host's agents are parked: a 'pending' row, or a pushed retry, brings them back when it resumes.
   const taken = new Map<string, number>();
   const assigned = new Map<string, number>();
   const work: Work[] = [];
-  let left = 0;
+  const parked: AgentTarget[] = [];
+  const parkedUntil: string[] = [];
+  const trimmed: AgentTarget[] = [];
   for (const [uri, group] of byUri) {
     const plan = planFetch(uri, assigned);
+    const share = hostShare(plan.host);
+    if (share === 0) {
+      const until = new Date(Math.max(hostStats(plan.host).pausedUntil, Date.now() + 60_000)).toISOString();
+      for (const agent of group) {
+        parked.push(agent);
+        parkedUntil.push(until);
+      }
+      continue;
+    }
     const n = taken.get(plan.host) ?? 0;
-    if (n < hostShare(plan.host)) {
+    if (n < share) {
       taken.set(plan.host, n + 1);
       work.push({ uri, agents: group, ...plan });
     } else {
-      left += group.length;
+      trimmed.push(...group);
     }
   }
+  await parkAgents(parked, parkedUntil);
   let fetched = 0;
   let failed = 0;
   const seen = new Map<string, Seen>();
@@ -612,21 +650,43 @@ async function runPass(): Promise<PassStats> {
     if (outcome === "ok") fetched += agents;
     else failed += agents;
   });
-  left += notStarted;
-  const selected = agents.length - left;
+  const unhandled = [...trimmed, ...notStarted.flatMap((entry) => entry.agents)];
+  const selected = agents.length - unhandled.length;
   learnHosts(seen);
-  // Everything due was taken and written: later passes only need what the indexer writes from here on.
-  // Otherwise the backlog is re-scanned next pass, which is the full scan until it drains.
-  if (left === 0 && queueDepth <= agents.length) state.watermark = new Date(started - WATERMARK_LAG_MS);
+  // The watermark moves when every agent that is due on its own account (never fetched, or a new URI)
+  // was fetched, parked, or deferred: from then on only what the indexer writes is new. Retries and
+  // re-fetches come back through next_retry_at and never hold it.
+  const freshSelected = agents.filter((agent) => agent.fresh).length;
+  const freshUnhandled = unhandled.filter((agent) => agent.fresh).length;
+  if (freshUnhandled === 0 && freshDepth <= freshSelected) state.watermark = new Date(started - WATERMARK_LAG_MS);
   return {
     at: new Date().toISOString(),
     selected,
     fetched,
     failed,
     deferred: deferred.size,
+    parked: parked.length,
     durationMs: Date.now() - started,
-    backlog: left > 0 || queueDepth > agents.length,
+    backlog: unhandled.length > 0 || queueDepth > agents.length,
   };
+}
+
+/**
+ * Agents whose host is paused: a never-fetched agent gets a 'pending' row due when the pause ends, and
+ * a row whose retry or re-fetch is due is pushed to then, so neither is selected again in the meantime.
+ */
+async function parkAgents(agents: AgentTarget[], until: string[]): Promise<void> {
+  if (agents.length === 0) return;
+  await getPool().query(
+    `INSERT INTO enrich.registration_files (chain_id, agent_id, agent_uri, fetch_status, next_retry_at, attempts)
+     SELECT u.chain, u.agent, u.uri, 'pending', u.until::timestamptz, 0
+     FROM unnest($1::int[], $2::numeric[], $3::text[], $4::text[]) AS u(chain, agent, uri, until)
+     ON CONFLICT (chain_id, agent_id) DO UPDATE SET next_retry_at = EXCLUDED.next_retry_at
+     WHERE enrich.registration_files.next_retry_at IS NOT NULL
+       AND enrich.registration_files.next_retry_at <= now()
+       AND enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri`,
+    [agents.map((a) => a.chain_id), agents.map((a) => a.agent_id), agents.map((a) => a.agent_uri), until],
+  );
 }
 
 /**
@@ -700,7 +760,7 @@ async function runJobs(): Promise<void> {
       const chainId = Number(job.payload.chainId);
       const agentId = String(job.payload.agentId ?? "");
       const found = await getPool().query<AgentTarget>(
-        `SELECT chain_id, agent_id::text AS agent_id, agent_uri, 0 AS attempts, registered_at::text AS registered_at, true AS has_file
+        `SELECT chain_id, agent_id::text AS agent_id, agent_uri, 0 AS attempts, registered_at::text AS registered_at, true AS has_file, false AS fresh
          FROM erc8004.agents WHERE chain_id = $1 AND agent_id = $2`,
         [chainId, agentId],
       );
