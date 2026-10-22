@@ -87,26 +87,32 @@ const DUE_AGENTS = `
       )
       AND NOT (COALESCE(r.error, '') = ANY($2::text[]) AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri)
   ),
-  ranked AS (
-    SELECT *,
-           row_number() OVER (
-             PARTITION BY chain_id, (agent_uri LIKE 'data:%')
-             ORDER BY priority, registered_at DESC NULLS LAST
-           ) AS rn,
-           -- A pass lasts as long as its slowest host. Capping each host keeps one slow platform
-           -- from holding every other platform's fetches back.
+  by_host AS (
+    -- Rank within each host first, so a chain's share interleaves its hosts instead of taking
+    -- the newest rows, which would all belong to whichever platform registered most recently.
+    SELECT due.*,
            row_number() OVER (
              PARTITION BY chain_id, substring(agent_uri from '^https?://([^/]+)')
              ORDER BY priority, registered_at DESC NULLS LAST
            ) AS host_rn,
            count(*) OVER () AS queue_depth
     FROM due
+  ),
+  ranked AS (
+    SELECT *,
+           row_number() OVER (
+             PARTITION BY chain_id, (agent_uri LIKE 'data:%')
+             ORDER BY host_rn, priority, registered_at DESC NULLS LAST
+           ) AS rn
+    FROM by_host
+    WHERE host_rn <= $6
   )
   SELECT chain_id, agent_id, agent_uri, attempts, queue_depth::text AS queue_depth
   FROM ranked
   WHERE (agent_uri LIKE 'data:%' AND rn <= $3)
-     OR (agent_uri NOT LIKE 'data:%' AND rn <= $4 AND host_rn <= $6)
-  ORDER BY (agent_uri LIKE 'data:%') DESC, priority, registered_at DESC NULLS LAST
+     OR (agent_uri NOT LIKE 'data:%' AND rn <= $4)
+  -- rn first, so the overall limit also interleaves chains rather than favouring the newest one.
+  ORDER BY (agent_uri LIKE 'data:%') DESC, priority, rn
   LIMIT $5
 `;
 
