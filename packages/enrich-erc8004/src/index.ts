@@ -58,7 +58,7 @@ async function isPaused(): Promise<boolean> {
  *    has 0 and selects nothing. $8 share of a host not seen yet. $9 the IPFS test: every IPFS URI counts
  *    under the host 'ipfs', whose share is the sum of the gateways' shares.
  */
-const DUE_AGENTS = `
+const DUE_SET = `
   WITH candidates AS (
     SELECT chain_id, agent_id FROM erc8004.agents WHERE updated_at > $1 AND agent_uri <> ''
     UNION
@@ -94,7 +94,9 @@ const DUE_AGENTS = `
         OR (r.fetch_status = 'error' AND r.next_retry_at IS NOT NULL AND r.next_retry_at <= now())
       )
       AND NOT (COALESCE(r.error, '') = ANY($2::text[]) AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri)
-  ),
+  )`;
+
+const DUE_AGENTS = `${DUE_SET},
   by_host AS (
     -- Rank within each host first, so a chain's share interleaves its hosts instead of taking
     -- the newest rows, which would all belong to whichever platform registered most recently.
@@ -124,6 +126,11 @@ const DUE_AGENTS = `
   -- rn first, so the overall limit interleaves chains and hosts instead of taking one host's retries first.
   ORDER BY (agent_uri LIKE 'data:%') DESC, rn, priority
   LIMIT $5
+`;
+
+/** How many agents are due, for a pass that selected none: every host with work may be paused. */
+const DUE_COUNT = `${DUE_SET.replace("$9", "$3")}
+  SELECT count(*)::text AS n FROM due
 `;
 
 /**
@@ -172,7 +179,8 @@ const hostSlots = new Map<string, { active: number; waiting: (() => void)[] }>()
 function hostStats(host: string): HostStats {
   let stats = hosts.get(host);
   if (!stats) {
-    stats = { concurrency: Math.max(1, Math.min(4, budget().perHost)), latency: null, pausedUntil: 0, pauses: 0, lastPass: null };
+    // Two to begin with: a platform that limits requests by the minute is found before it is flooded.
+    stats = { concurrency: Math.max(1, Math.min(2, budget().perHost)), latency: null, pausedUntil: 0, pauses: 0, lastPass: null };
     hosts.set(host, stats);
   }
   return stats;
@@ -532,6 +540,11 @@ async function selectAgents(since: Date): Promise<Selection> {
     firstShare(),
     IPFS_URI_SQL_PATTERN,
   ]);
+  if (result.rows.length === 0) {
+    // Nothing selected does not mean nothing due: a paused host's rows are left out. Count them.
+    const count = await getPool().query<{ n: string }>(DUE_COUNT, [since, [...TERMINAL_FETCH_ERRORS], IPFS_URI_SQL_PATTERN]);
+    return { agents: [], queueDepth: Number(count.rows[0]?.n ?? 0) };
+  }
   const queueDepth = Number(result.rows[0]?.queue_depth ?? 0);
   return { agents: result.rows.map(({ queue_depth: _depth, ...agent }) => agent), queueDepth };
 }
