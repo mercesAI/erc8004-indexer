@@ -36,6 +36,8 @@ export type FetchResult = {
   ok: true;
   body: string;
   httpStatus: number | null;
+  /** Host the body came from after redirects: a gateway for IPFS, null for a data: URI. */
+  finalHost: string | null;
   hash: string;
   parsed: ParsedRegistration;
 } | {
@@ -203,7 +205,7 @@ function fetchDeadline(): number {
   return Date.now() + 3 * envInt("FETCH_TIMEOUT_MS", 8000);
 }
 
-async function httpGet(raw: string, deadline: number, hops = 0): Promise<{ body: string; httpStatus: number }> {
+async function httpGet(raw: string, deadline: number, hops = 0): Promise<{ body: string; httpStatus: number; url: string }> {
   const remaining = deadline - Date.now();
   if (remaining <= 0) throw new Error("timeout");
   const url = publicUrl(raw);
@@ -283,7 +285,7 @@ async function httpGet(raw: string, deadline: number, hops = 0): Promise<{ body:
     error.httpStatus = result.status;
     throw error;
   }
-  return { body: result.body, httpStatus: result.status };
+  return { body: result.body, httpStatus: result.status, url: url.href };
 }
 
 /** The gateways in IPFS_GATEWAY, comma-separated, each ending in a slash. */
@@ -329,6 +331,7 @@ export async function resolveUri(uri: string, gateway?: string): Promise<FetchRe
   try {
     let body: string;
     let httpStatus: number | null = null;
+    let finalHost: string | null = null;
     const path = ipfsPath(uri);
     if (path != null) {
       const base = gateway ?? gateways()[0];
@@ -336,10 +339,12 @@ export async function resolveUri(uri: string, gateway?: string): Promise<FetchRe
       const fetched = await httpGet(onGateway(base, path), fetchDeadline());
       body = fetched.body;
       httpStatus = fetched.httpStatus;
+      finalHost = new URL(fetched.url).hostname.toLowerCase();
     } else if (uri.startsWith("https://") || uri.startsWith("http://")) {
       const fetched = await httpGet(uri, fetchDeadline());
       body = fetched.body;
       httpStatus = fetched.httpStatus;
+      finalHost = new URL(fetched.url).hostname.toLowerCase();
     } else if (uri.startsWith("data:application/json") && uri.includes(";base64,")) {
       const encoded = uri.slice(uri.indexOf(";base64,") + ";base64,".length);
       const decoded = Buffer.from(encoded, "base64");
@@ -359,6 +364,7 @@ export async function resolveUri(uri: string, gateway?: string): Promise<FetchRe
       ok: true,
       body: stored,
       httpStatus,
+      finalHost,
       hash: createHash("sha256").update(stored).digest("hex"),
       parsed: parseRegistration(parsedJson),
     };

@@ -164,10 +164,10 @@ export async function applyEvents(client: pg.PoolClient, chainId: number, events
     switch (event.name) {
       case "Registered":
         await client.query(
-          `INSERT INTO erc8004.agents (chain_id, agent_id, owner, agent_uri, registered_block, registered_at, feedback_count)
-           VALUES ($1, $2, $3, $4, $5, $6, 0)
+          `INSERT INTO erc8004.agents (chain_id, agent_id, owner, agent_uri, registered_block, registered_at, registered_by, feedback_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $3, 0)
            ON CONFLICT (chain_id, agent_id) DO UPDATE SET
-             owner = EXCLUDED.owner, agent_uri = EXCLUDED.agent_uri,
+             owner = EXCLUDED.owner, agent_uri = EXCLUDED.agent_uri, registered_by = EXCLUDED.registered_by,
              registered_block = EXCLUDED.registered_block, registered_at = EXCLUDED.registered_at, updated_at = now()`,
           [chainId, num(a.agentId), addr(a.owner), text(a.agentURI), event.blockNumber.toString(), time],
         );

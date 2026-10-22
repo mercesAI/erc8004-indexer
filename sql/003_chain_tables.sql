@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS erc8004.agents (
   owner text NOT NULL,
   agent_uri text NOT NULL,
   agent_wallet text,
+  -- The address register() was called from: the minter, from the Registered event. Transfers change
+  -- owner but never this, so publisher rules that name a minting contract cannot be fooled by a gift.
+  registered_by text,
   registered_block numeric(78,0),
   registered_at numeric(78,0),
   last_transfer_at numeric(78,0),
@@ -25,6 +28,7 @@ CREATE TABLE IF NOT EXISTS erc8004.agents (
 -- When this row was last written by the indexer (database time, not chain time). The enrich worker
 -- uses it to find agents whose URI may have changed without scanning the whole table.
 ALTER TABLE erc8004.agents ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE erc8004.agents ADD COLUMN IF NOT EXISTS registered_by text;
 
 CREATE INDEX IF NOT EXISTS agents_owner ON erc8004.agents (owner);
 CREATE INDEX IF NOT EXISTS agents_updated_at ON erc8004.agents (updated_at);

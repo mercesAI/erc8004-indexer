@@ -143,6 +143,64 @@ CREATE TABLE IF NOT EXISTS enrich.agent_services (
   PRIMARY KEY (chain_id, agent_id, name, endpoint)
 );
 
+-- final_host is where the file actually came from after redirects. refetches counts fetches of an
+-- unchanged URI after its first success; the publisher job schedules one while a file on a
+-- publisher's host does not yet prove its agent. next_retry_at on an 'ok' row is such a re-fetch.
+ALTER TABLE enrich.registration_files ADD COLUMN IF NOT EXISTS final_host text;
+ALTER TABLE enrich.registration_files ADD COLUMN IF NOT EXISTS refetches integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS enrich_registration_due
+  ON enrich.registration_files (next_retry_at) WHERE next_retry_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS enrich_registration_fetched_at
+  ON enrich.registration_files (fetched_at);
+
+-- Publishers: the platform that registered an agent on someone's behalf. The rules are publishers.yaml
+-- at the repo root; packages/enrich-erc8004/src/publishers.ts evaluates them and writes these tables.
+
+CREATE TABLE IF NOT EXISTS enrich.publishers (
+  key text PRIMARY KEY,
+  name text NOT NULL,
+  website text,
+  kind text,
+  position integer NOT NULL,
+  rules jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- One row per agent that matched a publisher. status is 'verified' or 'claimed'; proof names the rule
+-- (registrations, owner_field, minter, host, content). registered_at is copied from the agent so the
+-- list index below serves "newest agents of one publisher on one chain".
+CREATE TABLE IF NOT EXISTS enrich.agent_publishers (
+  chain_id integer NOT NULL,
+  agent_id numeric NOT NULL,
+  publisher_key text NOT NULL,
+  status text NOT NULL,
+  proof text NOT NULL,
+  registered_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (chain_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS agent_publishers_list
+  ON enrich.agent_publishers (publisher_key, chain_id, registered_at DESC);
+
+CREATE TABLE IF NOT EXISTS enrich.publisher_counts (
+  publisher_key text NOT NULL,
+  chain_id integer NOT NULL,
+  verified integer NOT NULL,
+  claimed integer NOT NULL,
+  reviews bigint NOT NULL,
+  first_registered_at timestamptz,
+  last_registered_at timestamptz,
+  PRIMARY KEY (publisher_key, chain_id)
+);
+
+CREATE TABLE IF NOT EXISTS enrich.publisher_runs (
+  id integer PRIMARY KEY,
+  rules_hash text NOT NULL,
+  ran_at timestamptz NOT NULL,
+  full_run_at timestamptz
+);
+
 -- Ops control plane.
 
 CREATE TABLE IF NOT EXISTS ops.worker_control (

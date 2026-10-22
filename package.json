@@ -15,6 +15,7 @@
     "sanity": "tsx packages/ops/src/cli/sanity.ts",
     "verify:read": "tsx scripts/verify-read.ts",
     "reindex": "tsx scripts/reindex.ts",
+    "backfill:registered-by": "tsx scripts/backfill-registered-by.ts",
     "migrate:ponder": "tsx scripts/migrate-from-ponder.ts",
     "cleanup:ponder": "tsx scripts/cleanup-ponder.ts",
     "typecheck": "pnpm --filter @merces/shared --filter @merces/importer-subgraph --filter @merces/enrich-erc8004 --filter @merces/ops --filter @merces/indexer-erc8004 exec tsc --noEmit"

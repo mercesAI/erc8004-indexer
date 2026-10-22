@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@merces/shared": "workspace:*"
+    "@merces/shared": "workspace:*",
+    "yaml": "2.8.1"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",

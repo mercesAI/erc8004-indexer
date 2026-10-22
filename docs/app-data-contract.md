@@ -59,6 +59,9 @@ All of these are views. `SELECT` only. They update as the collectors run. A quer
 | `read.validations` | one validator request | `(chain_id, request_hash)` |
 | `read.registration_files` | the fetched file, including JSON | `(chain_id, agent_id)` |
 | `read.agent_metadata` | one on-chain metadata key | `(chain_id, agent_id, key)` |
+| `read.publishers` | a platform that registers agents for others, with counts | `key` |
+| `read.publisher_chains` | one publisher's counts on one chain | `(publisher_key, chain_id)` |
+| `read.publisher_agents` | one agent attributed to a publisher | `(chain_id, agent_id)` |
 
 `read.agents` is the list and the header of a detail page. Join the other views on `chain_id` and `agent_id` when you need them. Do not `SELECT *` from `read.registration_files` in a list. Column `raw` is the whole file.
 
@@ -90,6 +93,9 @@ All of these are views. `SELECT` only. They update as the collectors run. A quer
 | `fetch_error` | text or null | Set when `fetch_status` is `error` |
 | `fetched_at` | timestamptz or null | Last fetch attempt |
 | `content_hash` | text or null | Hash of the file body when the fetch succeeded |
+| `publisher_key` | text or null | The platform this agent is attributed to, see Publishers below. Null means independent, or not attributed yet |
+| `publisher_name` | text or null | Display name of that publisher |
+| `publisher_status` | text or null | `verified` or `claimed`. Only `verified` is proof; `claimed` is a self-declared label |
 
 `uri_kind` decides what the screen can promise:
 
@@ -103,6 +109,25 @@ All of these are views. `SELECT` only. They update as the collectors run. A quer
 A later failed fetch does not wipe an earlier success. If `fetch_status` is `error` and `name` is still set, the name is from the previous good file. Prefer fields from a row whose `fetch_status` is `ok`. There is no `read.registration_files` row until the first attempt, so a missing row means "not tried yet", which is different from `fetch_status` null on the agent only when the join has not matched. On `read.agents`, null `fetch_status` means no attempt row.
 
 Six `fetch_error` values are final for the URI they were recorded against and are not retried while that URI stays: `unsupported uri scheme`, `invalid json`, `blocked address`, `unstorable content`, `HTTP 404`, `HTTP 410`. Every other error retries after 1 hour, then 6 hours, 1 day, and then every 7 days. When an agent gets a new on-chain URI, the fetcher tries it on the next pass regardless of the old result; until then `read.registration_files.agent_uri` still names the old URI.
+
+### Publishers
+
+A publisher is the platform that registered an agent on someone's behalf: Central City, EvoEvo, Termix, and so on. The rules live in `publishers.yaml` in this repo, and the enrich worker evaluates them after every pass.
+
+`publisher_status` has two values, and the difference decides what the screen may say:
+
+- `verified`: the agent belongs to the publisher. The proof is something nobody else can produce: the registration file is served from the publisher's own host and names this agent's id on this chain; or that file names the on-chain minter as its owner; or the agent was minted by one of the publisher's contracts.
+- `claimed`: the file only says so, or the URI merely points at the publisher's host. Anyone can register an agent that does this. Show it as "claims <publisher>" at most, and never count it as the publisher's.
+
+A publisher filter, chip, or count must use `publisher_status = 'verified'`. `read.publishers.verified_agents` is that count.
+
+`read.publishers`: `key`, `name`, `website`, `kind` (`platform`, `framework`, `art-drop`, …), `position` (the order in the rules file), `verified_agents`, `claimed_agents`, `reviews` (non-revoked reviews of verified and claimed agents together), `first_registered_at`, `last_registered_at`. One row per publisher in the rules file, with zeros when nothing has matched yet.
+
+`read.publisher_chains`: the same counts per `(publisher_key, chain_id)`, with `chain_key` and `chain_name`.
+
+`read.publisher_agents`: one row per attributed agent, with `publisher_key`, `publisher_name`, `publisher_status`, `publisher_proof` (`registrations`, `owner_field`, `minter`, `host`, or `content`), the agent columns a list needs (`chain_id`, `chain_key`, `chain_name`, `agent_id`, `owner`, `agent_uri`, `uri_kind`, `agent_wallet`, `registered_at`, `feedback_count`, `last_feedback_at`), and `name`, `description`, `image`, `active`, `fetch_status` from the file. Use it for a publisher's list: it is indexed for `publisher_key` and `chain_id` ordered by `registered_at DESC`. `read.agents` carries the same three publisher columns for a detail page.
+
+Attribution lags a fetch by at most one enrich pass, about a minute. A file that does not prove its agent yet is fetched again after 1 hour, 6 hours, 1 day and 7 days, so a new Central City agent usually moves from `claimed` to `verified` within the hour.
 
 ### Other views
 
@@ -197,8 +222,24 @@ GROUP BY 1, 2, 3
 ORDER BY agents DESC;
 ```
 
+Newest verified agents of one publisher on one chain:
+
+```sql
+SELECT chain_id, chain_key, agent_id::text AS agent_id, owner, name, image,
+       feedback_count, registered_at
+FROM read.publisher_agents
+WHERE publisher_key = 'centralcity'
+  AND publisher_status = 'verified'
+  AND chain_id = 8453
+ORDER BY registered_at DESC
+LIMIT 25;
+```
+
+Search within a publisher the same way, adding `AND (name ILIKE '%' || $1 || '%' OR agent_id::text = $1 OR owner = lower($1))`. The chips come from `read.publishers`; order them by `verified_agents DESC` or by `position`.
+
 ## What not to do
 
+- Do not label an agent with a publisher, or count it for one, unless `publisher_status` is `verified`.
 - Do not read `erc8004`, `enrich`, `mirror`, or `ops`. `app_ro` is denied those schemas. `mirror` is a subgraph copy and runs ahead of the chain indexer, so its counts are a different population.
 - Do not assume a name, a description, an image, or a service. Trust those fields when `fetch_status` is `ok`. If status is `error` and a name is still present, it is left over from an earlier success.
 - Do not treat `uri_kind = 'empty'` or `'invalid'` as a collector bug.

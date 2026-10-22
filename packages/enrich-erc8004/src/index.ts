@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { envInt, getPool, log } from "@merces/shared";
 import { gateways, ipfsPath, IPFS_URI_SQL_PATTERN, isTerminalFetchError, resolveUri, RETRY_MS, TERMINAL_FETCH_ERRORS, THROTTLE_RETRY_MS, type ParsedRegistration } from "./fetchUri.js";
+import { publisherState, runPublishers } from "./publishers.js";
 
 type AgentTarget = {
   chain_id: number;
@@ -51,7 +52,8 @@ async function isPaused(): Promise<boolean> {
  * target window, and no platform starves another.
  *
  * $1 watermark: only agents the indexer wrote after this time are considered, plus every file whose
- *    retry is due. That keeps a pass to a few index lookups instead of a scan of every agent.
+ *    next_retry_at has come: a failed fetch on its ladder, or a good file the publisher job wants to
+ *    see again. That keeps a pass to a few index lookups instead of a scan of every agent.
  * $2 terminal errors: final for the URI they were recorded against. A new on-chain URI is tried again.
  * $3 data: URIs per chain (decoded locally, no network). $4 network fetches per chain. $5 overall limit.
  * $6 hard cap on one host's rows per chain. $7 learned share per host, JSON {host: rows}; a paused host
@@ -63,7 +65,7 @@ const DUE_SET = `
     SELECT chain_id, agent_id FROM erc8004.agents WHERE updated_at > $1 AND agent_uri <> ''
     UNION
     SELECT chain_id, agent_id FROM enrich.registration_files
-    WHERE fetch_status = 'error' AND next_retry_at IS NOT NULL AND next_retry_at <= now()
+    WHERE next_retry_at IS NOT NULL AND next_retry_at <= now()
   ),
   due AS (
     SELECT a.chain_id,
@@ -81,6 +83,7 @@ const DUE_SET = `
            CASE
              WHEN r.fetch_status = 'error' AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri THEN 0
              WHEN r.agent_id IS NOT NULL AND r.agent_uri IS DISTINCT FROM a.agent_uri THEN 1
+             WHEN r.fetch_status = 'ok' THEN 3
              ELSE 2
            END AS priority
     FROM candidates c
@@ -91,7 +94,7 @@ const DUE_SET = `
       AND (
         r.agent_id IS NULL
         OR r.agent_uri IS DISTINCT FROM a.agent_uri
-        OR (r.fetch_status = 'error' AND r.next_retry_at IS NOT NULL AND r.next_retry_at <= now())
+        OR (r.next_retry_at IS NOT NULL AND r.next_retry_at <= now())
       )
       AND NOT (COALESCE(r.error, '') = ANY($2::text[]) AND r.agent_uri IS NOT DISTINCT FROM a.agent_uri)
   )`;
@@ -403,10 +406,12 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
       await client.query(
         `INSERT INTO enrich.registration_files (
            chain_id, agent_id, agent_uri, content_hash, raw, name, description, image, active,
-           x402_support, supported_trust, fetch_status, http_status, error, fetched_at, next_retry_at, attempts
+           x402_support, supported_trust, fetch_status, http_status, error, fetched_at, next_retry_at, attempts,
+           final_host, refetches
          ) VALUES (
            $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
-           $10, $11, 'ok', $12, NULL, now(), NULL, 0
+           $10, $11, 'ok', $12, NULL, now(), NULL, 0,
+           $13, 0
          )
          ON CONFLICT (chain_id, agent_id) DO UPDATE SET
            agent_uri = EXCLUDED.agent_uri,
@@ -423,7 +428,12 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
            error = NULL,
            fetched_at = now(),
            next_retry_at = NULL,
-           attempts = 0`,
+           attempts = 0,
+           final_host = EXCLUDED.final_host,
+           -- The same good URI fetched again is a re-fetch; a new URI starts the count over.
+           refetches = CASE
+             WHEN enrich.registration_files.fetch_status = 'ok' AND enrich.registration_files.agent_uri IS NOT DISTINCT FROM EXCLUDED.agent_uri
+             THEN enrich.registration_files.refetches + 1 ELSE 0 END`,
         [
           agent.chain_id,
           agent.agent_id,
@@ -437,6 +447,7 @@ async function writeResult(agent: AgentTarget, result: Awaited<ReturnType<typeof
           parsed.x402Support,
           parsed.supportedTrust,
           result.httpStatus,
+          result.finalHost,
         ],
       );
       await client.query("DELETE FROM enrich.agent_services WHERE chain_id = $1 AND agent_id = $2", [agent.chain_id, agent.agent_id]);
@@ -676,6 +687,7 @@ function startHealth(): void {
           lastPass: state.lastPass,
           watermark: state.watermark.toISOString(),
           hosts: hostReport(),
+          publishers: publisherState,
         }),
       );
       return;
@@ -688,6 +700,16 @@ function startHealth(): void {
       process.exit(1);
     })
     .listen(port, "127.0.0.1");
+}
+
+/** Publisher attribution runs after every pass; a broken rules file is logged, not fatal. */
+async function runPublishersSafely(): Promise<void> {
+  try {
+    await runPublishers();
+  } catch (error) {
+    publisherState.error = error instanceof Error ? error.message : String(error);
+    log("error", "publishers failed", { error: publisherState.error });
+  }
 }
 
 async function main(): Promise<void> {
@@ -704,6 +726,7 @@ async function main(): Promise<void> {
       state.lastPass = stats;
       log("info", "pass", stats);
       failures = 0;
+      await runPublishersSafely();
       // With a backlog this pass could work on, go straight to the next pass; otherwise look again
       // in a minute. A backlog whose every host is paused is nothing to do for now.
       const until = Date.now() + (stats.backlog && stats.selected > 0 ? 2000 : 60_000);

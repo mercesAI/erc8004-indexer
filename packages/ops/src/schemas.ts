@@ -23,6 +23,9 @@ const CHAIN_COLUMNS = (alias: string) => `
       COALESCE(c.chain_name, 'Chain ' || ${alias}.chain_id::text) AS chain_name`;
 
 const READ_VIEWS = [
+  "read.publisher_agents",
+  "read.publisher_chains",
+  "read.publishers",
   "read.agents",
   "read.registration_files",
   "read.services",
@@ -88,11 +91,17 @@ function readModelStatements(): string[] {
        r.fetch_status,
        r.error AS fetch_error,
        r.fetched_at,
-       r.content_hash
+       r.content_hash,
+       ap.publisher_key,
+       p.name AS publisher_name,
+       ap.status AS publisher_status
      FROM erc8004.agents a
      LEFT JOIN read.chains c ON c.chain_id = a.chain_id
      LEFT JOIN enrich.registration_files r
-       ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id`,
+       ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id
+     LEFT JOIN enrich.agent_publishers ap
+       ON ap.chain_id = a.chain_id AND ap.agent_id = a.agent_id
+     LEFT JOIN enrich.publishers p ON p.key = ap.publisher_key`,
     `CREATE VIEW read.registration_files AS
      SELECT
        r.chain_id,${CHAIN_COLUMNS("r")},
@@ -184,6 +193,62 @@ function readModelStatements(): string[] {
        read.unix_seconds(m.updated_at) AS updated_at
      FROM erc8004.agent_metadata m
      LEFT JOIN read.chains c ON c.chain_id = m.chain_id`,
+    // Publishers (publishers.yaml). verified_agents is what a publisher filter should count; claimed
+    // rows only carry a self-declared label.
+    `CREATE VIEW read.publishers AS
+     SELECT
+       p.key,
+       p.name,
+       p.website,
+       p.kind,
+       p.position,
+       COALESCE(sum(pc.verified), 0)::integer AS verified_agents,
+       COALESCE(sum(pc.claimed), 0)::integer AS claimed_agents,
+       COALESCE(sum(pc.reviews), 0)::bigint AS reviews,
+       min(pc.first_registered_at) AS first_registered_at,
+       max(pc.last_registered_at) AS last_registered_at
+     FROM enrich.publishers p
+     LEFT JOIN enrich.publisher_counts pc ON pc.publisher_key = p.key
+     GROUP BY p.key, p.name, p.website, p.kind, p.position`,
+    `CREATE VIEW read.publisher_chains AS
+     SELECT
+       pc.publisher_key,
+       pc.chain_id,${CHAIN_COLUMNS("pc")},
+       pc.verified,
+       pc.claimed,
+       pc.reviews,
+       pc.first_registered_at,
+       pc.last_registered_at
+     FROM enrich.publisher_counts pc
+     LEFT JOIN read.chains c ON c.chain_id = pc.chain_id`,
+    // Sized for "newest agents of one publisher on one chain": filter publisher_key and chain_id,
+    // order by registered_at DESC, and the index enrich.agent_publishers_list serves it.
+    `CREATE VIEW read.publisher_agents AS
+     SELECT
+       ap.publisher_key,
+       p.name AS publisher_name,
+       ap.status AS publisher_status,
+       ap.proof AS publisher_proof,
+       a.chain_id,${CHAIN_COLUMNS("a")},
+       a.agent_id,
+       a.owner,
+       a.agent_uri,
+       read.uri_kind(a.agent_uri) AS uri_kind,
+       a.agent_wallet,
+       ap.registered_at,
+       a.feedback_count,
+       read.unix_seconds(a.last_feedback_at) AS last_feedback_at,
+       r.name,
+       r.description,
+       r.image,
+       r.active,
+       r.fetch_status
+     FROM enrich.agent_publishers ap
+     JOIN erc8004.agents a ON a.chain_id = ap.chain_id AND a.agent_id = ap.agent_id
+     LEFT JOIN enrich.publishers p ON p.key = ap.publisher_key
+     LEFT JOIN read.chains c ON c.chain_id = a.chain_id
+     LEFT JOIN enrich.registration_files r
+       ON r.chain_id = a.chain_id AND r.agent_id = a.agent_id`,
     `GRANT USAGE ON SCHEMA read TO app_ro`,
     `GRANT SELECT ON ALL TABLES IN SCHEMA read TO app_ro`,
     `ALTER DEFAULT PRIVILEGES IN SCHEMA read GRANT SELECT ON TABLES TO app_ro`,

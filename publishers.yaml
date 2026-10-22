@@ -1,0 +1,108 @@
+# Publishers: platforms that register agents on someone's behalf.
+#
+# The enrich worker evaluates these rules after every pass (packages/enrich-erc8004/src/publishers.ts)
+# and writes enrich.agent_publishers; the app reads read.publishers and read.publisher_agents.
+# Editing this file triggers one full recompute on the next pass.
+#
+# An agent is VERIFIED for a publisher only through something nobody else can produce:
+#   proof: registrations   the file on one of `hosts` names this agent's id on this chain
+#   proof: owner_field     the file on one of `hosts` names the on-chain minter in its `owner` field
+#   minters:               the agent was minted by one of these addresses
+# Everything else gives CLAIMED at most: a file on `hosts` without proof, or `claims` matched on file
+# content (description, name, trust markers, service names, endpoint or image hosts), which any
+# registrant can copy.
+#
+# `hosts` are exact host names, lowercase, without a scheme or path. Never list shared hosting
+# (vercel.app, github, S3 in general, IPFS gateways): only the full name a single platform controls.
+# Order matters when two publishers match: the first verified match wins, then the first claimed.
+
+- key: centralcity
+  name: Central City
+  website: https://centralcity.ai
+  kind: platform
+  hosts: [centralcity.ai]
+  proof: registrations
+
+- key: evoevo
+  name: EvoEvo
+  website: https://evoevo.ai
+  kind: platform
+  hosts: [metadata.evoevo.ai, api.evoevo.ai, evoevo.ai]
+  proof: registrations
+  claims:
+    description_prefix: ["An EvoEvo AI Agent"]
+
+- key: termix
+  name: Termix
+  website: https://termix.live
+  kind: platform
+  hosts: [termix-platform-prod.s3.ap-southeast-1.amazonaws.com]
+  proof: owner_field
+  claims:
+    trust: [termix-platform]
+
+- key: alpharc
+  name: AlphaArc
+  website: https://alpharc.app
+  kind: platform
+  hosts: [api.alpharc.app]
+  proof: registrations
+  minters: ["0x72bb8416eefe38fe76a4568ed826359ac5253db1"]
+
+- key: olas
+  name: Olas
+  website: https://olas.network
+  kind: framework
+  hosts: [marketplace.olas.network]
+  proof: registrations
+
+- key: virtuals-acp
+  name: Virtuals ACP
+  website: https://app.virtuals.io/acp
+  kind: platform
+  hosts: [api.acp.virtuals.io]
+  proof: registrations
+
+- key: exquisite-land
+  name: Exquisite Land
+  website: https://exquisite.land
+  kind: art-drop
+  hosts: [agents.exquisite.land]
+  minters: ["0xde152afb7db5373f34876e1499fbd893a82dd336"]
+
+# Claimed only: the files carry nothing that ties them to the chain.
+
+- key: quackai
+  name: QuackAI
+  website: https://quackai.ai
+  kind: platform
+  hosts: [q402.quackai.ai]
+  claims:
+    service_names: [q402]
+
+- key: eve
+  name: EVE
+  kind: platform
+  hosts: [eve-8004.vercel.app]
+
+- key: ave
+  name: Ave.ai
+  website: https://ave.ai
+  kind: platform
+  claims:
+    name: ["Ave.ai Trading Agent"]
+    image_hosts: [www.iconaves.com]
+
+- key: debot
+  name: debot.ai
+  website: https://debot.ai
+  kind: platform
+  claims:
+    description_prefix: ["Trading agent from debot.ai"]
+
+- key: purr-fect-claw
+  name: Purr-Fect Claw
+  kind: platform
+  claims:
+    description_prefix: ["Purr-Fect Claw"]
+    name_prefix: ["Purr-Fect Claw"]
