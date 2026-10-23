@@ -31,3 +31,6 @@ DEPLOY.md
 
 # Handoff for the app repository; holds the app_ro password
 HANDOFF-app.md
+
+# Private planning docs and hand-off prompts (not part of the public repo)
+private/
